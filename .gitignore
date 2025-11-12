@@ -17,3 +17,8 @@ wheels/
 
 # Credentials
 src/credentials.h
+
+# mosquitto
+password.file
+mosquitto.db
+mosquitto.log

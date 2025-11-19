@@ -1,416 +1,412 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <PubSubClient.h>
+#include <ArduinoWebsockets.h>
 #include <WiFi.h>
+#include <esp_camera.h>
 
-// ============================================================================
-// CONFIGURABLE CONSTANTS - Easily adjustable settings
-// ============================================================================
-
-// Pin definitions - Left wheel
-#define ENCODER_LEFT_PIN 36
-#define PWM_LEFT_PIN 38
-#define HBL_IN1 41
-#define HBL_IN2 42
-
-// Pin definitions - Right wheel
-#define ENCODER_RIGHT_PIN 35
-#define PWM_RIGHT_PIN 37
-#define HBR_IN1 39
-#define HBR_IN2 40
-
-// Encoder debounce
-#define DEBOUNCE_US 5000UL
-
-// Wheel geometry - Left wheel
-#define WHEEL_RADIUS_MM_LEFT 49.67
-#define PULSES_PER_ROTATION_LEFT 64.0
-
-// Wheel geometry - Right wheel
-#define WHEEL_RADIUS_MM_RIGHT 49.67
-#define PULSES_PER_ROTATION_RIGHT 64.0
-
-// Control loop parameters
-#define CONTROL_PERIOD_MS 50
-#define KP_LEFT 300.0
-#define KI_LEFT 80.0
-#define KP_RIGHT 300.0
-#define KI_RIGHT 80.0
-#define PWM_MIN 0
-#define PWM_MAX 255
-#define SPEED_DEADBAND 0.01
-#define INTEGRATOR_CLAMP 50.0
-
-// Telemetry period
-#define TELEMETRY_PERIOD_MS 1000
-
-// MQTT topics
-#define TOPIC_CMD_SPEED "motor/speed"
-#define TOPIC_LEFT_ROTATION_COUNT "encoder/left/rotation_count"
-#define TOPIC_LEFT_FREQUENCY "encoder/left/frequency"
-#define TOPIC_LEFT_VELOCITY "encoder/left/velocity"
-#define TOPIC_RIGHT_ROTATION_COUNT "encoder/right/rotation_count"
-#define TOPIC_RIGHT_FREQUENCY "encoder/right/frequency"
-#define TOPIC_RIGHT_VELOCITY "encoder/right/velocity"
-
-// WiFi credentials
+#include "camera_pins.h"
 #include "credentials.h"
 
-// MQTT Broker configuration
-const char *mqtt_server = "192.168.0.146";
-const int mqtt_port = 1883;
-const char *mqtt_client_id = "esp32_encoder";
+// ===================================================================================
+// CONFIGURATION
+// ===================================================================================
 
-WiFiClient espClient;
-PubSubClient client(espClient);
+// --- Networking ---
+const char *WS_HOST = "192.168.0.146";
+const uint16_t WS_PORT = 8000;
+const char *WS_PATH = "/ws/robot";
+const unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
 
-// ============================================================================
-// Wheel Control Structure
-// ============================================================================
+// --- Physics & Tuning ---
+// Left Wheel
+#define PIN_ENC_L 18
+#define PIN_PWM_L 15
+#define PIN_IN1_L 16
+#define PIN_IN2_L 17
+#define TUNING_L {0.0, 0.0, 0.0}  // {kP, kI, kF}
 
-struct WheelControl
-{
-  int pwmPin;
-  int in1;
-  int in2;
-  int encoderPin;
-  volatile unsigned long count;
-  volatile unsigned long lastIsrMicros;
-  unsigned long lastCountControl;
-  unsigned long lastCountTelemetry;
-  unsigned long lastTelemetryTime;
-  double kp;
-  double ki;
-  double integrator;
-  double targetSpeed;
-  double measuredSpeed;
-  double pulsesPerRotation;
-  double wheelRadiusMm;
+// Right Wheel (Preserved but commented)
+// #define PIN_ENC_R   35
+// #define PIN_PWM_R   7
+// #define PIN_IN1_R   5
+// #define PIN_IN2_R   6
+// #define TUNING_R    {0.0, 0.0, 0.0}
+
+#define WHEEL_RADIUS_MM 49.67
+#define PULSES_PER_ROT 64.0
+#define PWM_LIMITS {0, 255}
+#define SPEED_DEADBAND 0.01
+#define INTEGRATOR_CLAMP 50.0
+#define SPEED_FILTER_ALPHA 0.4
+
+// --- Timing ---
+#define CONTROL_PERIOD_MS 10
+#define TELEMETRY_PERIOD_MS 200
+#define FRAME_STREAM_PERIOD_MS 200
+
+// ===================================================================================
+// DATA STRUCTURES
+// ===================================================================================
+
+using namespace websockets;
+
+struct __attribute__((packed)) FramePacketHeader {
+  uint32_t magic = 0x46524D31;  // "FRM1"
+  uint16_t version = 1;
+  uint16_t reserved = 0;
+  uint32_t frameId;
+  uint32_t timestampMs;
+  uint16_t width;
+  uint16_t height;
+  uint32_t payloadLength;
 };
 
-WheelControl leftWheel;
-WheelControl rightWheel;
+struct PidConfig {
+  double kp, ki, kf;
+};
 
-// ============================================================================
-// Interrupt Service Routines
-// ============================================================================
+// ===================================================================================
+// WHEEL CONTROLLER CLASS
+// ===================================================================================
 
-void IRAM_ATTR isrLeft()
-{
-  unsigned long now = micros();
-  if ((now - leftWheel.lastIsrMicros) >= DEBOUNCE_US)
-  {
-    leftWheel.count++;
-    leftWheel.lastIsrMicros = now;
+class WheelController {
+ public:
+  // Hardware Pins
+  const int pinPwm, pinIn1, pinIn2, pinEnc;
+
+  // State
+  volatile unsigned long encoderCount = 0;
+  unsigned long lastEncoderCount = 0;
+
+  double targetSpeed = 0.0;    // m/s
+  double measuredSpeed = 0.0;  // m/s (filtered)
+  double rawSpeed = 0.0;       // m/s (instant)
+  double measuredRpm = 0.0;
+  double integrator = 0.0;
+
+  WheelController(int pwm, int in1, int in2, int enc, PidConfig pid)
+      : pinPwm(pwm), pinIn1(in1), pinIn2(in2), pinEnc(enc), _pid(pid) {
+    // Pre-calculate physics constant
+    double circumference = 2 * M_PI * (WHEEL_RADIUS_MM / 1000.0);
+    _metersPerPulse = circumference / PULSES_PER_ROT;
   }
-}
 
-void IRAM_ATTR isrRight()
-{
-  unsigned long now = micros();
-  if ((now - rightWheel.lastIsrMicros) >= DEBOUNCE_US)
-  {
-    rightWheel.count++;
-    rightWheel.lastIsrMicros = now;
+  void begin() {
+    pinMode(pinIn1, OUTPUT);
+    pinMode(pinIn2, OUTPUT);
+    pinMode(pinPwm, OUTPUT);
+    pinMode(pinEnc, INPUT);
+    stop();
   }
-}
 
-// ============================================================================
-// WiFi Setup
-// ============================================================================
+  // Call from ISR
+  void IRAM_ATTR handleInterrupt() { encoderCount++; }
 
-void setup_wifi()
-{
-  delay(10);
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
+  void stop() {
+    digitalWrite(pinIn1, LOW);
+    digitalWrite(pinIn2, LOW);
+    analogWrite(pinPwm, 0);
+    targetSpeed = 0;
+    integrator = 0;
+  }
 
+  void update(unsigned long dtMs) {
+    // 1. Atomic Encoder Read
+    unsigned long currentCount;
+    noInterrupts();
+    currentCount = encoderCount;
+    interrupts();
+
+    unsigned long delta = currentCount - lastEncoderCount;
+    lastEncoderCount = currentCount;
+
+    // 2. Physics Calc
+    double dtSec = dtMs / 1000.0;
+    if (dtSec <= 0) dtSec = 0.001;
+
+    double instantSpeed = ((double)delta / dtSec) * _metersPerPulse;
+    rawSpeed = instantSpeed;
+
+    // Low Pass Filter
+    measuredSpeed = (SPEED_FILTER_ALPHA * instantSpeed) +
+                    ((1.0 - SPEED_FILTER_ALPHA) * measuredSpeed);
+    measuredRpm = (measuredSpeed / _metersPerPulse) * 60.0 /
+                  PULSES_PER_ROT;  // Simplified RPM math
+
+    // 3. PID Control
+    bool forward = (targetSpeed >= 0);
+    digitalWrite(pinIn1, forward ? HIGH : LOW);
+    digitalWrite(pinIn2, forward ? LOW : HIGH);
+
+    double targetAbs = fabs(targetSpeed);
+    double error = targetAbs - measuredSpeed;
+
+    // Integral Anti-windup
+    if (targetAbs < SPEED_DEADBAND) {
+      integrator = 0;
+    } else {
+      integrator += error * dtSec;
+      integrator = constrain(integrator, -INTEGRATOR_CLAMP, INTEGRATOR_CLAMP);
+    }
+
+    double u =
+        (_pid.kf * targetAbs) + (_pid.kp * error) + (_pid.ki * integrator);
+    int pwm = (int)constrain(round(u), 0.0, 255.0);
+
+    if (targetAbs < 0.01) pwm = 0;
+
+    // NOTE: VOU HARDCODAR O PWM PARA 100 PRA PODER TUNAR O KF, NA PROXIMA VEZ
+    // QUE EU FOR NO LAB
+
+    // pwm = 100;
+    analogWrite(pinPwm, pwm);
+  }
+
+ private:
+  PidConfig _pid;
+  double _metersPerPulse;
+};
+
+// ===================================================================================
+// GLOBALS & INSTANCES
+// ===================================================================================
+
+WebsocketsClient wsClient;
+bool cameraReady = false;
+uint32_t frameSequence = 0;
+
+// Instantiate Left Wheel
+WheelController leftWheel(PIN_PWM_L, PIN_IN1_L, PIN_IN2_L, PIN_ENC_L, TUNING_L);
+
+// Instantiate Right Wheel (Commented)
+// WheelController rightWheel(PIN_PWM_R, PIN_IN1_R, PIN_IN2_R, PIN_ENC_R,
+// TUNING_R);
+
+// ISR Wrappers (Required because we can't attach class methods directly to
+// interrupts)
+void IRAM_ATTR isrLeft() { leftWheel.handleInterrupt(); }
+// void IRAM_ATTR isrRight() { rightWheel.handleInterrupt(); }
+
+// ===================================================================================
+// NETWORK HELPERS
+// ===================================================================================
+
+void connectWiFi() {
+  Serial.printf("Connecting to %s", ssid);
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-
-  while (WiFi.status() != WL_CONNECTED)
-  {
+  while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-
-  randomSeed(micros());
-
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
+  Serial.printf("\nConnected: %s\n", WiFi.localIP().toString().c_str());
 }
 
-// ============================================================================
-// MQTT Callback
-// ============================================================================
-
-void mqtt_callback(char *topic, byte *payload, unsigned int length)
-{
-  if (strcmp(topic, TOPIC_CMD_SPEED) != 0)
-  {
-    return;
-  }
-  StaticJsonDocument<128> doc;
-  DeserializationError error = deserializeJson(doc, payload, length);
-
-  if (error)
-  {
-    Serial.print("JSON parse error: ");
-    Serial.println(error.c_str());
+void handleIncomingJson(String data) {
+  JsonDocument doc;
+  if (deserializeJson(doc, data)) {
+    Serial.println(F("JSON Error"));
     return;
   }
 
-  double leftSpeed = doc["left"] | 0.0;
-  double rightSpeed = doc["right"] | 0.0;
-
-  leftWheel.targetSpeed = leftSpeed;
-  rightWheel.targetSpeed = rightSpeed;
-
-  Serial.print("Received speeds - Left: ");
-  Serial.print(leftSpeed);
-  Serial.print(" m/s, Right: ");
-  Serial.print(rightSpeed);
-  Serial.println(" m/s");
-}
-
-// ============================================================================
-// MQTT Reconnect
-// ============================================================================
-
-void reconnect_mqtt()
-{
-  while (!client.connected())
-  {
-    Serial.print("Attempting MQTT connection...");
-
-    const char *mqtt_user = "robotica";
-    const char *mqtt_pass = "robotica123";
-
-    if (client.connect(mqtt_client_id, mqtt_user, mqtt_pass))
-    {
-      Serial.println("connected");
-      client.subscribe(TOPIC_CMD_SPEED);
-    }
-    else
-    {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      delay(5000);
-    }
+  if (doc["type"] == "command") {
+    leftWheel.targetSpeed = doc["left"] | 0.0;
+    // rightWheel.targetSpeed = doc["right"] | 0.0;
+    Serial.printf("Target Left: %.3f\n", leftWheel.targetSpeed);
   }
 }
 
-// ============================================================================
-// Control Loop (PI Controller)
-// ============================================================================
-
-void updateWheelControl(WheelControl &wheel, unsigned long dtMs)
-{
-  unsigned long countCopy;
-  noInterrupts();
-  countCopy = wheel.count;
-  interrupts();
-
-  unsigned long deltaCount = countCopy - wheel.lastCountControl;
-  wheel.lastCountControl = countCopy;
-
-  double dt = dtMs / 1000.0;
-  double rotationCount = deltaCount / wheel.pulsesPerRotation;
-  double frequency_Hz = rotationCount / dt;
-  wheel.measuredSpeed = frequency_Hz * 2 * M_PI * (wheel.wheelRadiusMm / 1000.0);
-
-  bool forward = (wheel.targetSpeed >= 0);
-  digitalWrite(wheel.in1, forward ? HIGH : LOW);
-  digitalWrite(wheel.in2, forward ? LOW : HIGH);
-
-  double targetAbs = fabs(wheel.targetSpeed);
-  double error = targetAbs - wheel.measuredSpeed;
-
-  if (targetAbs < SPEED_DEADBAND)
-  {
-    wheel.integrator = 0;
-  }
-  else
-  {
-    wheel.integrator += error * dt;
-    wheel.integrator = constrain(wheel.integrator, -INTEGRATOR_CLAMP, INTEGRATOR_CLAMP);
+void manageWebSocket() {
+  static unsigned long lastAttempt = 0;
+  if (wsClient.available()) {
+    wsClient.poll();
+    return;
   }
 
-  double u = (wheel.kp * error) + (wheel.ki * wheel.integrator);
-  int pwm = (int)round(constrain(u, (double)PWM_MIN, (double)PWM_MAX));
-  analogWrite(wheel.pwmPin, pwm);
+  if (millis() - lastAttempt > WS_RECONNECT_INTERVAL_MS) {
+    lastAttempt = millis();
+    Serial.printf("WS Connect: %s:%d\n", WS_HOST, WS_PORT);
+    wsClient.connect(WS_HOST, WS_PORT, WS_PATH);
+  }
 }
 
-// ============================================================================
-// Telemetry Publishing
-// ============================================================================
+// ===================================================================================
+// TELEMETRY & CAMERA
+// ===================================================================================
 
-void publishTelemetry(WheelControl &wheel, const char *topicRotation,
-                      const char *topicFreq, const char *topicVel,
-                      const char *label)
-{
-  unsigned long countCopy;
-  noInterrupts();
-  countCopy = wheel.count;
-  interrupts();
+void sendTelemetry() {
+  if (!wsClient.available()) return;
 
-  unsigned long deltaCount = countCopy - wheel.lastCountTelemetry;
-  wheel.lastCountTelemetry = countCopy;
-
+  static unsigned long lastTime = 0;
   unsigned long now = millis();
-  unsigned long deltaTimeMs = now - wheel.lastTelemetryTime;
-  wheel.lastTelemetryTime = now;
+  if (now - lastTime < TELEMETRY_PERIOD_MS) return;
+  lastTime = now;
 
-  if (deltaTimeMs == 0)
-    deltaTimeMs = TELEMETRY_PERIOD_MS;
+  JsonDocument doc;
+  doc["type"] = "telemetry";
+  doc["timestamp"] = now;
 
-  double rotationCount = deltaCount / wheel.pulsesPerRotation;
-  double frequency_Hz = rotationCount / (deltaTimeMs / 1000.0);
-  double speed_m_s = frequency_Hz * 2 * M_PI * (wheel.wheelRadiusMm / 1000.0);
+  JsonObject l = doc["left"].to<JsonObject>();
+  l["speed"] = leftWheel.measuredSpeed;
+  l["rpm"] = leftWheel.measuredRpm;
+  l["target"] = leftWheel.targetSpeed;
+  l["int"] = leftWheel.integrator;
 
-  Serial.print(label);
-  Serial.print(" - Tick: ");
-  Serial.print(deltaCount);
-  Serial.print("\tRotations: ");
-  Serial.print(rotationCount, 4);
-  Serial.print("\tFreq (Hz): ");
-  Serial.print(frequency_Hz, 4);
-  Serial.print("\tVel (m/s): ");
-  Serial.print(speed_m_s, 4);
-  Serial.println(" m/s");
+  // Commented Right Wheel Telemetry
+  // JsonObject r = doc["right"].to<JsonObject>();
+  // r["speed"] = rightWheel.measuredSpeed; ...
 
-  char msg_buffer[50];
-
-  snprintf(msg_buffer, sizeof(msg_buffer), "%.4f", rotationCount);
-  client.publish(topicRotation, msg_buffer);
-
-  snprintf(msg_buffer, sizeof(msg_buffer), "%.4f", frequency_Hz);
-  client.publish(topicFreq, msg_buffer);
-
-  snprintf(msg_buffer, sizeof(msg_buffer), "%.4f", speed_m_s);
-  client.publish(topicVel, msg_buffer);
+  String payload;
+  serializeJson(doc, payload);
+  wsClient.send(payload);
 }
 
-// ============================================================================
-// Setup
-// ============================================================================
+void setupCamera() {
+  camera_config_t config;
 
-void setup()
-{
+  // 1. Pin Mappings (These constants come from camera_pins.h)
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = CAM_PIN_D0;
+  config.pin_d1 = CAM_PIN_D1;
+  config.pin_d2 = CAM_PIN_D2;
+  config.pin_d3 = CAM_PIN_D3;
+  config.pin_d4 = CAM_PIN_D4;
+  config.pin_d5 = CAM_PIN_D5;
+  config.pin_d6 = CAM_PIN_D6;
+  config.pin_d7 = CAM_PIN_D7;
+  config.pin_xclk = CAM_PIN_XCLK;
+  config.pin_pclk = CAM_PIN_PCLK;
+  config.pin_vsync = CAM_PIN_VSYNC;
+  config.pin_href = CAM_PIN_HREF;
+  config.pin_sscb_sda = CAM_PIN_SIOD;
+  config.pin_sscb_scl = CAM_PIN_SIOC;
+  config.pin_pwdn = CAM_PIN_PWDN;
+  config.pin_reset = CAM_PIN_RESET;
+
+  // 2. Signal Clock & Format
+  config.xclk_freq_hz = 20000000;  // 20MHz XCLK
+  config.pixel_format = PIXFORMAT_GRAYSCALE;
+
+  // 3. Frame Settings
+  config.frame_size = FRAMESIZE_QVGA;
+
+  config.fb_count = 1;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+
+  // 4. Initialize
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+
+  // 5. Optional: Flip frame if camera is mounted upside down
+  sensor_t *s = esp_camera_sensor_get();
+  // s->set_vflip(s, 1);
+  // s->set_hmirror(s, 1);
+
+  cameraReady = true;  // <--- IMPORTANT: This allows loop() to stream
+  Serial.println("Camera Configured Successfully");
+}
+
+void streamCamera(unsigned long now) {
+  static unsigned long lastFrame = 0;
+
+  // Basic throttle and readiness checks
+  if (!cameraReady || !wsClient.available() ||
+      (now - lastFrame < FRAME_STREAM_PERIOD_MS))
+    return;
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return;
+
+  if (fb->format == PIXFORMAT_GRAYSCALE) {
+    size_t hSize = sizeof(FramePacketHeader);
+    size_t totalSize = hSize + fb->len;
+
+    // Allocate buffer for Header + Raw Data
+    uint8_t *packet = (uint8_t *)malloc(totalSize);
+
+    if (packet) {
+      FramePacketHeader header;
+      header.magic = 0x46524D31;
+      header.frameId = frameSequence++;
+      header.timestampMs = now;
+      header.width = fb->width;
+      header.height = fb->height;
+      header.payloadLength = fb->len;
+
+      // Copy header
+      memcpy(packet, &header, hSize);
+      // Copy raw grayscale data
+      memcpy(packet + hSize, fb->buf, fb->len);
+
+      wsClient.sendBinary((const char *)packet, totalSize);
+
+      free(packet);
+      lastFrame = now;
+    } else {
+      Serial.println("Camera Malloc Failed");
+    }
+  }
+
+  esp_camera_fb_return(fb);
+}
+
+// ===================================================================================
+// MAIN
+// ===================================================================================
+
+void setup() {
+  neopixelWrite(RGB_BUILTIN, 50, 0, 50);  // Purple
   Serial.begin(115200);
   delay(1000);
-  Serial.println("Starting dual-wheel control...");
 
-  digitalWrite(LED_BUILTIN, HIGH);
-  delay(1000);
-  digitalWrite(LED_BUILTIN, LOW);
-  delay(1000);
-  digitalWrite(LED_BUILTIN, HIGH);
-  delay(1000);
-  digitalWrite(LED_BUILTIN, LOW);
+  // Hardware Setup
+  leftWheel.begin();
+  attachInterrupt(digitalPinToInterrupt(leftWheel.pinEnc), isrLeft, RISING);
 
-  // Initialize left wheel structure
-  leftWheel.pwmPin = PWM_LEFT_PIN;
-  leftWheel.in1 = HBL_IN1;
-  leftWheel.in2 = HBL_IN2;
-  leftWheel.encoderPin = ENCODER_LEFT_PIN;
-  leftWheel.count = 0;
-  leftWheel.lastIsrMicros = 0;
-  leftWheel.lastCountControl = 0;
-  leftWheel.lastCountTelemetry = 0;
-  leftWheel.lastTelemetryTime = millis();
-  leftWheel.kp = KP_LEFT;
-  leftWheel.ki = KI_LEFT;
-  leftWheel.integrator = 0;
-  leftWheel.targetSpeed = 0;
-  leftWheel.measuredSpeed = 0;
-  leftWheel.pulsesPerRotation = PULSES_PER_ROTATION_LEFT;
-  leftWheel.wheelRadiusMm = WHEEL_RADIUS_MM_LEFT;
+  // rightWheel.begin();
+  // attachInterrupt(digitalPinToInterrupt(rightWheel.pinEnc), isrRight,
+  // RISING);
 
-  // Initialize right wheel structure
-  rightWheel.pwmPin = PWM_RIGHT_PIN;
-  rightWheel.in1 = HBR_IN1;
-  rightWheel.in2 = HBR_IN2;
-  rightWheel.encoderPin = ENCODER_RIGHT_PIN;
-  rightWheel.count = 0;
-  rightWheel.lastIsrMicros = 0;
-  rightWheel.lastCountControl = 0;
-  rightWheel.lastCountTelemetry = 0;
-  rightWheel.lastTelemetryTime = millis();
-  rightWheel.kp = KP_RIGHT;
-  rightWheel.ki = KI_RIGHT;
-  rightWheel.integrator = 0;
-  rightWheel.targetSpeed = 0;
-  rightWheel.measuredSpeed = 0;
-  rightWheel.pulsesPerRotation = PULSES_PER_ROTATION_RIGHT;
-  rightWheel.wheelRadiusMm = WHEEL_RADIUS_MM_RIGHT;
+  connectWiFi();
 
-  // Configure pins - Left wheel
-  pinMode(HBL_IN1, OUTPUT);
-  pinMode(HBL_IN2, OUTPUT);
-  pinMode(PWM_LEFT_PIN, OUTPUT);
-  pinMode(ENCODER_LEFT_PIN, INPUT_PULLUP);
-  digitalWrite(HBL_IN1, HIGH);
-  digitalWrite(HBL_IN2, LOW);
-  analogWrite(PWM_LEFT_PIN, 0);
+  setupCamera();
 
-  // Configure pins - Right wheel
-  pinMode(HBR_IN1, OUTPUT);
-  pinMode(HBR_IN2, OUTPUT);
-  pinMode(PWM_RIGHT_PIN, OUTPUT);
-  pinMode(ENCODER_RIGHT_PIN, INPUT_PULLUP);
-  digitalWrite(HBR_IN1, HIGH);
-  digitalWrite(HBR_IN2, LOW);
-  analogWrite(PWM_RIGHT_PIN, 0);
+  // WebSocket Callbacks
+  wsClient.onMessage([](WebsocketsMessage msg) {
+    if (msg.isText()) handleIncomingJson(msg.data());
+  });
 
-  // Attach interrupts
-  attachInterrupt(digitalPinToInterrupt(ENCODER_LEFT_PIN), isrLeft, RISING);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_RIGHT_PIN), isrRight, RISING);
+  wsClient.onEvent([](WebsocketsEvent event, String data) {
+    if (event == WebsocketsEvent::ConnectionOpened) {
+      Serial.println("WS Connected");
+      wsClient.send("{\"type\":\"hello\",\"role\":\"esp32\"}");
+    }
+  });
 
-  // Setup WiFi and MQTT
-  setup_wifi();
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(mqtt_callback);
+  neopixelWrite(RGB_BUILTIN, 0, 50, 0);  // Green
 }
 
-// ============================================================================
-// Main Loop
-// ============================================================================
-
-void loop()
-{
-  static unsigned long lastControlTime = 0;
+void loop() {
   unsigned long now = millis();
 
-  // MQTT connection check and message processing
-  if (!client.connected())
-  {
-    reconnect_mqtt();
-  }
-  client.loop();
+  // 1. Network
+  manageWebSocket();
 
-  // Control loop
-  if (now - lastControlTime >= CONTROL_PERIOD_MS)
-  {
-    unsigned long dtMs = now - lastControlTime;
-    lastControlTime = now;
-    updateWheelControl(leftWheel, dtMs);
-    updateWheelControl(rightWheel, dtMs);
+  // 2. Control Loop
+  static unsigned long lastControl = 0;
+  if (now - lastControl >= CONTROL_PERIOD_MS) {
+    unsigned long dt = now - lastControl;
+    lastControl = now;
+    leftWheel.update(dt);
+    // rightWheel.update(dt);
   }
 
-  // Telemetry loop (1 Hz) - check each wheel independently
-  if (now - leftWheel.lastTelemetryTime >= TELEMETRY_PERIOD_MS)
-  {
-    publishTelemetry(leftWheel, TOPIC_LEFT_ROTATION_COUNT, TOPIC_LEFT_FREQUENCY,
-                     TOPIC_LEFT_VELOCITY, "LEFT");
-  }
-  if (now - rightWheel.lastTelemetryTime >= TELEMETRY_PERIOD_MS)
-  {
-    publishTelemetry(rightWheel, TOPIC_RIGHT_ROTATION_COUNT, TOPIC_RIGHT_FREQUENCY,
-                     TOPIC_RIGHT_VELOCITY, "RIGHT");
-  }
+  // 3. Reporting
+  sendTelemetry();
+  // streamCamera(now);
 }

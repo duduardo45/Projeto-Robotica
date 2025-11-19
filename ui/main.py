@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Literal, NamedTuple
 
-import cv2
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -421,17 +420,27 @@ class Robot:
         pose.y += linear_velocity * math.sin(pose.theta) * dt
 
     def _detect_tags(self, packet: FramePacket) -> list[TagDetectionState]:
+        # Create a numpy array from the raw bytes
         np_buffer = np.frombuffer(packet.data, dtype=np.uint8)
-        frame = cv2.imdecode(np_buffer, cv2.IMREAD_COLOR)
-        if frame is None:
+
+        # FIX: Reshape the raw data based on dimensions.
+        # Do NOT use imdecode for raw grayscale.
+        try:
+            gray = np_buffer.reshape((packet.height, packet.width))
+        except ValueError:
+            # Handle case where buffer size doesn't match height*width
             return []
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # 'gray' is already grayscale, so we can pass it directly to the detector
+        # (No need for cv2.cvtColor if the source is already PIXFORMAT_GRAYSCALE)
+
         detections = self._detector.detect(
             gray,
             estimate_tag_pose=True,
             camera_params=CAMERA_PARAMS,
             tag_size=APRILTAG_SIZE_METERS,
         )
+
         results: list[TagDetectionState] = []
         for det in detections:
             pose_state = self._world_pose_from_detection(det.tag_id, det.pose_t)

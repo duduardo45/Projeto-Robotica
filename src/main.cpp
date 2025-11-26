@@ -7,9 +7,10 @@
 #include "camera_pins.h"
 #include "credentials.h"
 
-// ===================================================================================
+//
+
 // CONFIGURATION
-// ===================================================================================
+//
 
 // --- Networking ---
 const char *WS_HOST = "192.168.0.146";
@@ -23,13 +24,15 @@ const unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
 #define PIN_PWM_L 15
 #define PIN_IN1_L 16
 #define PIN_IN2_L 17
-#define TUNING_L {0.0, 0.0, 0.0}  // {kP, kI, kF}
+#define PWM_CHAN_L 2                  // Channel 0 is taken by Camera! Using 2.
+#define TUNING_L {50.0, 10.0, 100.0}  // {kP, kI, kF}
 
 // Right Wheel (Preserved but commented)
 // #define PIN_ENC_R   35
 // #define PIN_PWM_R   7
 // #define PIN_IN1_R   5
 // #define PIN_IN2_R   6
+// #define PWM_CHAN_R  3
 // #define TUNING_R    {0.0, 0.0, 0.0}
 
 #define WHEEL_RADIUS_MM 49.67
@@ -37,16 +40,21 @@ const unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
 #define PWM_LIMITS {0, 255}
 #define SPEED_DEADBAND 0.01
 #define INTEGRATOR_CLAMP 50.0
-#define SPEED_FILTER_ALPHA 0.4
+// SPEED_FILTER_ALPHA the lower you make it, the slower is the exponential
+// average:
+#define SPEED_FILTER_ALPHA 0.15
 
 // --- Timing ---
 #define CONTROL_PERIOD_MS 10
-#define TELEMETRY_PERIOD_MS 200
+#define TELEMETRY_PERIOD_MS 500
 #define FRAME_STREAM_PERIOD_MS 200
+#define PWM_FREQ 5000
+#define PWM_RES 8
 
-// ===================================================================================
+//
+
 // DATA STRUCTURES
-// ===================================================================================
+//
 
 using namespace websockets;
 
@@ -65,15 +73,18 @@ struct PidConfig {
   double kp, ki, kf;
 };
 
-// ===================================================================================
+//
+
 // WHEEL CONTROLLER CLASS
-// ===================================================================================
+//
 
 class WheelController {
  public:
-  // Hardware Pins
-  const int pinPwm, pinIn1, pinIn2, pinEnc;
-
+  const int pwmChannel;
+  const int pinPwm;
+  const int pinIn1;
+  const int pinIn2;
+  const int pinEnc;
   // State
   volatile unsigned long encoderCount = 0;
   unsigned long lastEncoderCount = 0;
@@ -84,8 +95,14 @@ class WheelController {
   double measuredRpm = 0.0;
   double integrator = 0.0;
 
-  WheelController(int pwm, int in1, int in2, int enc, PidConfig pid)
-      : pinPwm(pwm), pinIn1(in1), pinIn2(in2), pinEnc(enc), _pid(pid) {
+  WheelController(const PidConfig pid, const int pwmChannel, const int pinPwm,
+                  const int pinIn1, const int pinIn2, const int pinEnc)
+      : _pid(pid),
+        pwmChannel(pwmChannel),
+        pinPwm(pinPwm),
+        pinIn1(pinIn1),
+        pinIn2(pinIn2),
+        pinEnc(pinEnc) {
     // Pre-calculate physics constant
     double circumference = 2 * M_PI * (WHEEL_RADIUS_MM / 1000.0);
     _metersPerPulse = circumference / PULSES_PER_ROT;
@@ -94,8 +111,12 @@ class WheelController {
   void begin() {
     pinMode(pinIn1, OUTPUT);
     pinMode(pinIn2, OUTPUT);
-    pinMode(pinPwm, OUTPUT);
     pinMode(pinEnc, INPUT);
+
+    // --- Use ledcAttachPin ---
+    ledcSetup(pwmChannel, PWM_FREQ, PWM_RES);
+    ledcAttachPin(pinPwm, pwmChannel);
+    ledcWrite(pwmChannel, 0);
     stop();
   }
 
@@ -105,33 +126,52 @@ class WheelController {
   void stop() {
     digitalWrite(pinIn1, LOW);
     digitalWrite(pinIn2, LOW);
-    analogWrite(pinPwm, 0);
+    ledcWrite(pwmChannel, 0);
     targetSpeed = 0;
     integrator = 0;
   }
 
-  void update(unsigned long dtMs) {
+  void update(unsigned long nowMs) {
     // 1. Atomic Encoder Read
     unsigned long currentCount;
     noInterrupts();
     currentCount = encoderCount;
     interrupts();
 
-    unsigned long delta = currentCount - lastEncoderCount;
+    // 2. High Precision Time Calculation
+    unsigned long currentMicros = micros();
+    unsigned long dtMicros = currentMicros - lastMicros;
+
+    // Sanity check to prevent divide by zero on first run
+    if (dtMicros == 0) return;
+
+    // 3. Calculate Speed
+    long delta = currentCount - lastEncoderCount;
+
+    // ONLY update physics if enough time has passed or pulse occurred
+    // This helps stability on very fast loops, though your 10ms loop is fine.
+
     lastEncoderCount = currentCount;
+    lastMicros = currentMicros;
 
-    // 2. Physics Calc
-    double dtSec = dtMs / 1000.0;
-    if (dtSec <= 0) dtSec = 0.001;
-
+    double dtSec = dtMicros / 1000000.0;
     double instantSpeed = ((double)delta / dtSec) * _metersPerPulse;
-    rawSpeed = instantSpeed;
 
-    // Low Pass Filter
+    rawSpeed = instantSpeed;  // Store for debugging
+
+    // 4. Low Pass Filter (The Tuning Knob)
     measuredSpeed = (SPEED_FILTER_ALPHA * instantSpeed) +
                     ((1.0 - SPEED_FILTER_ALPHA) * measuredSpeed);
-    measuredRpm = (measuredSpeed / _metersPerPulse) * 60.0 /
-                  PULSES_PER_ROT;  // Simplified RPM math
+
+    // 5. Zero-Speed Timeout
+    // If we haven't seen an encoder pulse in X time, force speed to 0.
+    // Otherwise, the filter takes forever to decay to 0.
+    if (delta == 0 && dtSec > 0.1) {  // If no pulse for 100ms
+      measuredSpeed = 0;
+      rawSpeed = 0;
+    }
+
+    measuredRpm = (measuredSpeed / _metersPerPulse) * 60.0 / PULSES_PER_ROT;
 
     // 3. PID Control
     bool forward = (targetSpeed >= 0);
@@ -155,41 +195,41 @@ class WheelController {
 
     if (targetAbs < 0.01) pwm = 0;
 
-    // NOTE: VOU HARDCODAR O PWM PARA 100 PRA PODER TUNAR O KF, NA PROXIMA VEZ
-    // QUE EU FOR NO LAB
-
-    // pwm = 100;
-    analogWrite(pinPwm, pwm);
+    ledcWrite(pwmChannel, pwm);
   }
 
  private:
   PidConfig _pid;
   double _metersPerPulse;
+  unsigned long lastMicros = 0;
 };
 
-// ===================================================================================
+//
+
 // GLOBALS & INSTANCES
-// ===================================================================================
+//
 
 WebsocketsClient wsClient;
 bool cameraReady = false;
 uint32_t frameSequence = 0;
 
 // Instantiate Left Wheel
-WheelController leftWheel(PIN_PWM_L, PIN_IN1_L, PIN_IN2_L, PIN_ENC_L, TUNING_L);
+WheelController leftWheel(TUNING_L, PWM_CHAN_L, PIN_PWM_L, PIN_IN1_L, PIN_IN2_L,
+                          PIN_ENC_L);
 
 // Instantiate Right Wheel (Commented)
-// WheelController rightWheel(PIN_PWM_R, PIN_IN1_R, PIN_IN2_R, PIN_ENC_R,
-// TUNING_R);
+// WheelController rightWheel(TUNING_R, PWM_CHAN_R, PIN_PWM_R, PIN_IN1_R,
+// PIN_IN2_R, PIN_ENC_R);
 
 // ISR Wrappers (Required because we can't attach class methods directly to
 // interrupts)
 void IRAM_ATTR isrLeft() { leftWheel.handleInterrupt(); }
 // void IRAM_ATTR isrRight() { rightWheel.handleInterrupt(); }
 
-// ===================================================================================
+//
+
 // NETWORK HELPERS
-// ===================================================================================
+//
 
 void connectWiFi() {
   Serial.printf("Connecting to %s", ssid);
@@ -230,9 +270,10 @@ void manageWebSocket() {
   }
 }
 
-// ===================================================================================
-// TELEMETRY & CAMERA
-// ===================================================================================
+//
+
+//         // TELEMETRY & CAMERA
+//         //
 
 void sendTelemetry() {
   if (!wsClient.available()) return;
@@ -259,6 +300,13 @@ void sendTelemetry() {
   String payload;
   serializeJson(doc, payload);
   wsClient.send(payload);
+
+  Serial.printf("Telemetry Sent: %s\n", payload.c_str());
+  Serial.printf("Left Instant Speed: %.3f\n", leftWheel.rawSpeed);
+  Serial.printf("Left Filtered Speed: %.3f\n", leftWheel.measuredSpeed);
+  Serial.printf("Left RPM: %.3f\n", leftWheel.measuredRpm);
+  Serial.printf("Left Target: %.3f\n", leftWheel.targetSpeed);
+  Serial.printf("Left Integrator: %.3f\n", leftWheel.integrator);
 }
 
 void setupCamera() {
@@ -355,9 +403,9 @@ void streamCamera(unsigned long now) {
   esp_camera_fb_return(fb);
 }
 
-// ===================================================================================
+//
 // MAIN
-// ===================================================================================
+//
 
 void setup() {
   neopixelWrite(RGB_BUILTIN, 50, 0, 50);  // Purple
@@ -366,7 +414,8 @@ void setup() {
 
   // Hardware Setup
   leftWheel.begin();
-  attachInterrupt(digitalPinToInterrupt(leftWheel.pinEnc), isrLeft, RISING);
+
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_L), isrLeft, RISING);
 
   // rightWheel.begin();
   // attachInterrupt(digitalPinToInterrupt(rightWheel.pinEnc), isrRight,
@@ -374,7 +423,7 @@ void setup() {
 
   connectWiFi();
 
-  setupCamera();
+  // setupCamera();
 
   // WebSocket Callbacks
   wsClient.onMessage([](WebsocketsMessage msg) {

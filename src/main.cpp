@@ -24,8 +24,8 @@ const unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
 #define PIN_PWM_L 15
 #define PIN_IN1_L 16
 #define PIN_IN2_L 17
-#define PWM_CHAN_L 2                  // Channel 0 is taken by Camera! Using 2.
-#define TUNING_L {50.0, 10.0, 100.0}  // {kP, kI, kF}
+#define PWM_CHAN_L 2  // Channel 0 is taken by Camera! Using 2.
+#define TUNING_L {0.0, 100.0, 50.0, 10.0}  // {ks, kf, kp, ki}
 
 // Right Wheel (Preserved but commented)
 // #define PIN_ENC_R   35
@@ -45,7 +45,7 @@ const unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
 #define SPEED_FILTER_ALPHA 0.15
 
 // --- Timing ---
-#define CONTROL_PERIOD_MS 10
+#define CONTROL_PERIOD_MS 50  // testar isso, menor nem sempre é melhor
 #define TELEMETRY_PERIOD_MS 500
 #define FRAME_STREAM_PERIOD_MS 200
 #define PWM_FREQ 5000
@@ -70,7 +70,7 @@ struct __attribute__((packed)) FramePacketHeader {
 };
 
 struct PidConfig {
-  double kp, ki, kf;
+  double ks, kf, kp, ki;
 };
 
 //
@@ -141,39 +141,47 @@ class WheelController {
     // 2. High Precision Time Calculation
     unsigned long currentMicros = micros();
     unsigned long dtMicros = currentMicros - lastMicros;
+    lastMicros = currentMicros;  // Update this immediately
 
-    // Sanity check to prevent divide by zero on first run
-    if (dtMicros == 0) return;
+    // Sanity check (prevent divide by zero or overflow on first run)
+    if (dtMicros < 100) return;
+
+    double dtSec = dtMicros / 1000000.0;
 
     // 3. Calculate Speed
     long delta = currentCount - lastEncoderCount;
-
-    // ONLY update physics if enough time has passed or pulse occurred
-    // This helps stability on very fast loops, though your 10ms loop is fine.
-
     lastEncoderCount = currentCount;
-    lastMicros = currentMicros;
 
-    double dtSec = dtMicros / 1000000.0;
-    double instantSpeed = ((double)delta / dtSec) * _metersPerPulse;
+    double instantSpeed = 0.0;
 
-    rawSpeed = instantSpeed;  // Store for debugging
+    if (delta != 0) {
+      // We moved! Update the speed normally
+      instantSpeed = ((double)delta / dtSec) * _metersPerPulse;
+      lastPulseMicros = currentMicros;  // Reset timeout timer
+    } else {
+      // We did NOT move this loop.
+      // Check how long it has been since the last move.
+      // If > 100ms (0.1s), force speed to 0.
+      if ((currentMicros - lastPulseMicros) > 100000) {
+        instantSpeed = 0.0;
+        measuredSpeed = 0.0;  // Force filter reset
+      } else {
+        // We haven't moved *this* X ms, but we moved recently.
+        // Keep instantSpeed as 0, but let the Low Pass Filter
+        // naturally decay the measuredSpeed down.
+        instantSpeed = 0.0;
+      }
+    }
 
-    // 4. Low Pass Filter (The Tuning Knob)
+    rawSpeed = instantSpeed;
+
+    // 4. Low Pass Filter
     measuredSpeed = (SPEED_FILTER_ALPHA * instantSpeed) +
                     ((1.0 - SPEED_FILTER_ALPHA) * measuredSpeed);
 
-    // 5. Zero-Speed Timeout
-    // If we haven't seen an encoder pulse in X time, force speed to 0.
-    // Otherwise, the filter takes forever to decay to 0.
-    if (delta == 0 && dtSec > 0.1) {  // If no pulse for 100ms
-      measuredSpeed = 0;
-      rawSpeed = 0;
-    }
-
     measuredRpm = (measuredSpeed / _metersPerPulse) * 60.0 / PULSES_PER_ROT;
 
-    // 3. PID Control
+    // 5. Control Logic
     bool forward = (targetSpeed >= 0);
     digitalWrite(pinIn1, forward ? HIGH : LOW);
     digitalWrite(pinIn2, forward ? LOW : HIGH);
@@ -189,11 +197,15 @@ class WheelController {
       integrator = constrain(integrator, -INTEGRATOR_CLAMP, INTEGRATOR_CLAMP);
     }
 
-    double u =
-        (_pid.kf * targetAbs) + (_pid.kp * error) + (_pid.ki * integrator);
-    int pwm = (int)constrain(round(u), 0.0, 255.0);
+    // 6. Calculate Output
+    // Only apply Ks (Static Kick) if we actually want to move
+    double output = 0.0;
+    if (targetAbs > 0.01) {
+      output = _pid.ks + (_pid.kf * targetAbs) + (_pid.kp * error) +
+               (_pid.ki * integrator);
+    }
 
-    if (targetAbs < 0.01) pwm = 0;
+    int pwm = (int)constrain(round(output), 0.0, 255.0);
 
     ledcWrite(pwmChannel, pwm);
   }
@@ -202,6 +214,7 @@ class WheelController {
   PidConfig _pid;
   double _metersPerPulse;
   unsigned long lastMicros = 0;
+  unsigned long lastPulseMicros = 0;
 };
 
 //

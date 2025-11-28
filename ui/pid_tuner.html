@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Robot PID Tuner</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/uPlot/1.6.24/uPlot.min.css">
+    <style>
+        body {
+            background: #111;
+            color: #eee;
+            font-family: monospace;
+        }
+
+        .chart-container {
+            margin-bottom: 20px;
+        }
+
+        .controls {
+            margin: 20px;
+            padding: 10px;
+            border: 1px solid #444;
+        }
+
+        input {
+            background: #222;
+            color: white;
+            border: 1px solid #555;
+            padding: 5px;
+        }
+
+        button {
+            cursor: pointer;
+            padding: 5px 15px;
+            background: #007bff;
+            color: white;
+            border: none;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Real-Time PID Tuner</h1>
+
+    <div class="controls">
+        <h3>Send Command</h3>
+        Left Speed: <input type="number" id="speedInput" value="0.2" step="0.05">
+        <button onclick="sendCommand(parseFloat(document.getElementById('speedInput').value))">Go</button>
+        <button onclick="sendCommand(0)">STOP</button>
+    </div>
+
+    <div id="chart1" class="chart-container"></div>
+    <div id="chart2" class="chart-container"></div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/uPlot/1.6.24/uPlot.iife.min.js"></script>
+    <script>
+        // CONFIG
+        const WS_URL = "ws://localhost:8000/ws/dashboard"; // Make sure this matches your python server
+        const MAX_POINTS = 1000;
+
+        // DATA ARRAYS [Time, Target, Measured, PWM, P_term, I_term]
+        let data = [[], [], [], [], [], []];
+
+        // CHART 1: Speed (Target vs Actual)
+        const opts1 = {
+            title: "Velocity Response",
+            width: 800, height: 300,
+            scales: { x: { time: false }, y: { auto: true } },
+            series: [
+                { label: "Time" },
+                { label: "Target", stroke: "red", width: 2, dash: [10, 5] },
+                { label: "Measured", stroke: "cyan", width: 2 }
+            ]
+        };
+
+        // CHART 2: Internal PID Terms
+        const opts2 = {
+            title: "PID Internals & Output",
+            width: 800, height: 300,
+            scales: { x: { time: false }, y: { auto: true } },
+            series: [
+                { label: "Time" },
+                { label: "PWM Out", stroke: "yellow", width: 1 },
+                { label: "P Term", stroke: "green", width: 1 },
+                { label: "I Term", stroke: "magenta", width: 1 }
+            ]
+        };
+
+        let uplot1 = new uPlot(opts1, [data[0], data[1], data[2]], document.getElementById("chart1"));
+        let uplot2 = new uPlot(opts2, [data[0], data[3], data[4], data[5]], document.getElementById("chart2"));
+
+        // WEBSOCKET
+        const ws = new WebSocket(WS_URL);
+
+        ws.onopen = () => console.log("Connected to Dashboard Stream");
+
+        let startTime = null;
+
+        ws.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+
+                if (msg.type === "pid_log") {
+                    if (!startTime) startTime = msg.ts;
+                    const t = (msg.ts - startTime) / 1000.0; // Seconds
+
+                    // Shift if too many points
+                    if (data[0].length > MAX_POINTS) {
+                        data.forEach(ch => ch.shift());
+                    }
+
+                    // Push new data
+                    data[0].push(t);
+                    data[1].push(msg.left.t);   // Target
+                    data[2].push(msg.left.m);   // Measured
+                    data[3].push(msg.left.pwm); // Output
+                    data[4].push(msg.left.p);   // P
+                    data[5].push(msg.left.i);   // I
+
+                    // Redraw
+                    uplot1.setData([data[0], data[1], data[2]]);
+                    uplot2.setData([data[0], data[3], data[4], data[5]]);
+                }
+            } catch (e) {
+                // Ignore non-JSON or other message types
+            }
+        };
+
+        function sendCommand(speed) {
+            fetch("http://localhost:8000/control/speed", {
+                method: "POST",
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ left: speed, right: speed })
+            });
+        }
+    </script>
+</body>
+
+</html>

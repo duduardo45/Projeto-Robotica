@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import struct
 import time
@@ -11,6 +12,7 @@ from typing import Literal, NamedTuple
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from pupil_apriltags import Detector
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -51,6 +53,7 @@ def clamp(value: float, lower: float, upper: float) -> float:
 
 class FramePacket(NamedTuple):
     """Represents a parsed video frame packet from the robot."""
+
     frame_id: int
     timestamp_ms: int
     width: int
@@ -60,6 +63,7 @@ class FramePacket(NamedTuple):
 
 class WheelSample(BaseModel):
     """Telemetry data model for a single wheel."""
+
     rotation_count: float = Field(default=0.0, alias="rotation")
     frequency_rpm: float = 0.0
     speed_m_s: float = 0.0
@@ -71,6 +75,7 @@ class WheelSample(BaseModel):
 
 class Pose(BaseModel):
     """Represents the 2D pose of the robot."""
+
     x: float = 0.0
     y: float = 0.0
     theta: float = 0.0
@@ -78,6 +83,7 @@ class Pose(BaseModel):
 
 class RobotState(BaseModel):
     """The aggregate state of the robot, including pose and wheel telemetry."""
+
     pose: Pose = Field(default_factory=Pose)
     left: WheelSample = Field(default_factory=WheelSample)
     right: WheelSample = Field(default_factory=WheelSample)
@@ -86,6 +92,7 @@ class RobotState(BaseModel):
 
 class TelemetryIncoming(BaseModel):
     """Schema for telemetry messages received via WebSocket."""
+
     type: Literal["telemetry"]
     timestamp: int = Field(default_factory=monotonic_ms)
     left: WheelSample = Field(default_factory=WheelSample)
@@ -94,6 +101,7 @@ class TelemetryIncoming(BaseModel):
 
 class WheelsCommand(BaseModel):
     """Schema for motor control commands sent to the robot."""
+
     type: Literal["command"] = "command"
     left: float
     right: float
@@ -101,12 +109,14 @@ class WheelsCommand(BaseModel):
 
 class CommandRequest(BaseModel):
     """Schema for speed control requests via the API."""
+
     left: float
     right: float
 
 
 class CommandResponse(BaseModel):
     """Schema for the response to a command request."""
+
     status: str
     target: CommandRequest
     timestamp_ms: int = Field(default_factory=monotonic_ms)
@@ -114,6 +124,7 @@ class CommandResponse(BaseModel):
 
 class TagDetection(BaseModel):
     """Schema for a detected AprilTag."""
+
     tag_id: int
     decision_margin: float
     distance_m: float
@@ -124,12 +135,14 @@ class TagDetection(BaseModel):
 
 class VisionSnapshot(BaseModel):
     """Schema for the latest vision processing results."""
+
     last_frame_timestamp_ms: int
     detections: list[TagDetection]
 
 
 class MissionRequest(BaseModel):
     """Schema for requesting a new navigation mission."""
+
     pose: Pose
     position_tolerance: float = Field(default=0.03, gt=0)
     heading_tolerance_rad: float = Field(default=math.radians(8.0), gt=0)
@@ -139,6 +152,7 @@ class MissionRequest(BaseModel):
 
 class MissionStatus(BaseModel):
     """Schema for the current status of the mission runner."""
+
     state: Literal["idle", "running", "completed", "error"] = "idle"
     target: Pose | None = None
     started_ms: int | None = None
@@ -147,6 +161,7 @@ class MissionStatus(BaseModel):
 
 class RobotOfflineError(RuntimeError):
     """Exception raised when attempting to control a disconnected robot."""
+
     pass
 
 
@@ -196,6 +211,7 @@ def parse_frame_packet(payload: bytes) -> FramePacket | None:
 @dataclass
 class WheelSampleState:
     """Internal state representation of a wheel's telemetry."""
+
     rotation_count: float = 0.0
     frequency_rpm: float = 0.0
     speed_m_s: float = 0.0
@@ -206,6 +222,7 @@ class WheelSampleState:
 @dataclass
 class PoseState:
     """Internal state representation of the robot's pose."""
+
     x: float = 0.0
     y: float = 0.0
     theta: float = 0.0
@@ -214,6 +231,7 @@ class PoseState:
 @dataclass
 class RobotStateData:
     """Internal aggregator for robot state."""
+
     pose: PoseState = field(default_factory=PoseState)
     left: WheelSampleState = field(default_factory=WheelSampleState)
     right: WheelSampleState = field(default_factory=WheelSampleState)
@@ -223,6 +241,7 @@ class RobotStateData:
 @dataclass
 class TagDetectionState:
     """Internal representation of a tag detection."""
+
     tag_id: int
     decision_margin: float
     distance_m: float
@@ -234,6 +253,7 @@ class TagDetectionState:
 @dataclass
 class MissionPlan:
     """Internal representation of the active mission parameters."""
+
     pose: PoseState
     position_tolerance: float
     heading_tolerance_rad: float
@@ -244,6 +264,7 @@ class MissionPlan:
 @dataclass
 class MissionStatusState:
     """Internal state of the mission runner."""
+
     state: Literal["idle", "running", "completed", "error"] = "idle"
     target: PoseState | None = None
     started_ms: int | None = None
@@ -253,6 +274,31 @@ class MissionStatusState:
 APRILTAG_ANCHORS: dict[int, PoseState] = {
     1: PoseState(x=0.0, y=0.0, theta=0.0),
 }
+
+
+class DashboardHub:
+    """Tracks dashboard WebSocket connections and broadcasts messages to them."""
+
+    def __init__(self) -> None:
+        self._connections: set[WebSocket] = set()
+
+    async def register(self, websocket: WebSocket) -> None:
+        self._connections.add(websocket)
+
+    async def unregister(self, websocket: WebSocket) -> None:
+        self._connections.discard(websocket)
+
+    async def broadcast_text(self, message: str) -> None:
+        if not self._connections:
+            return
+        failed: list[WebSocket] = []
+        for ws in list(self._connections):
+            try:
+                await ws.send_text(message)
+            except Exception:
+                failed.append(ws)
+        for ws in failed:
+            await self.unregister(ws)
 
 
 class Robot:
@@ -711,6 +757,7 @@ class Robot:
 
 
 robot = Robot()
+dashboard_hub = DashboardHub()
 
 
 @asynccontextmanager
@@ -820,7 +867,14 @@ async def robot_websocket(websocket: WebSocket) -> None:
         while True:
             message = await websocket.receive()
             if "text" in message and message["text"] is not None:
-                await robot.handle_text_message(message["text"])
+                raw = message["text"]
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    data = None
+                if isinstance(data, dict) and data.get("type") == "pid_log":
+                    await dashboard_hub.broadcast_text(raw)
+                await robot.handle_text_message(raw)
             elif "bytes" in message and message["bytes"] is not None:
                 await robot.process_frame(message["bytes"])
             elif message.get("type") == "websocket.disconnect":
@@ -831,5 +885,27 @@ async def robot_websocket(websocket: WebSocket) -> None:
         await robot.detach_websocket(websocket)
 
 
+@app.websocket("/ws/dashboard")
+async def dashboard_websocket(websocket: WebSocket) -> None:
+    """WebSocket endpoint for dashboard clients that consume debug streams."""
+
+    await websocket.accept()
+    await dashboard_hub.register(websocket)
+    try:
+        while True:
+            # Currently read-only: just drain incoming messages to detect disconnects.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await dashboard_hub.unregister(websocket)
+
+
+@app.get("/dashboard")
+async def get_dashboard_html() -> HTMLResponse:
+    with open("pid_tuner.html", "r") as file:
+        return HTMLResponse(content=file.read(), media_type="text/html")
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

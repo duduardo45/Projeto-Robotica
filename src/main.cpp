@@ -8,7 +8,6 @@
 #include "credentials.h"
 
 //
-
 // CONFIGURATION
 //
 
@@ -25,27 +24,28 @@ const unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
 #define PIN_IN1_L 16
 #define PIN_IN2_L 17
 #define PWM_CHAN_L 2  // Channel 0 is taken by Camera! Using 2.
-#define TUNING_L {0.0, 100.0, 50.0, 10.0}  // {ks, kf, kp, ki}
+#define TUNING_L {100.0, 45.0, 120.0, 20.0}  // {ks, kf, kp, ki}
 
-// Right Wheel (Preserved but commented)
-// #define PIN_ENC_R   35
-// #define PIN_PWM_R   7
-// #define PIN_IN1_R   5
-// #define PIN_IN2_R   6
-// #define PWM_CHAN_R  3
-// #define TUNING_R    {0.0, 0.0, 0.0}
+// Right Wheel
+#define PIN_ENC_R 7
+#define PIN_PWM_R 42
+#define PIN_IN1_R 41
+#define PIN_IN2_R 6
+#define PWM_CHAN_R 3
+#define TUNING_R {140.0, 30.0, 120.0, 20.0}
 
 #define WHEEL_RADIUS_MM 49.67
 #define PULSES_PER_ROT 64.0
 #define PWM_LIMITS {0, 255}
 #define SPEED_DEADBAND 0.01
-#define INTEGRATOR_CLAMP 50.0
+#define INTEGRATOR_CLAMP 5.0
 // SPEED_FILTER_ALPHA the lower you make it, the slower is the exponential
 // average:
-#define SPEED_FILTER_ALPHA 0.15
+#define SPEED_FILTER_ALPHA 0.2
 
 // --- Timing ---
-#define CONTROL_PERIOD_MS 50  // testar isso, menor nem sempre é melhor
+#define CONTROL_PERIOD_MS 40  // testar isso, menor nem sempre é melhor
+#define DEBUG_PERIOD_MS 50
 #define TELEMETRY_PERIOD_MS 500
 #define FRAME_STREAM_PERIOD_MS 200
 #define PWM_FREQ 5000
@@ -94,6 +94,11 @@ class WheelController {
   double rawSpeed = 0.0;       // m/s (instant)
   double measuredRpm = 0.0;
   double integrator = 0.0;
+
+  double debug_p = 0;
+  double debug_i = 0;
+  double debug_f = 0;
+  double debug_out = 0;
 
   WheelController(const PidConfig pid, const int pwmChannel, const int pinPwm,
                   const int pinIn1, const int pinIn2, const int pinEnc)
@@ -198,12 +203,22 @@ class WheelController {
     }
 
     // 6. Calculate Output
-    // Only apply Ks (Static Kick) if we actually want to move
+
     double output = 0.0;
     if (targetAbs > 0.01) {
-      output = _pid.ks + (_pid.kf * targetAbs) + (_pid.kp * error) +
-               (_pid.ki * integrator);
+      // Break it down for logging
+      debug_f = _pid.kf * targetAbs;
+      debug_p = _pid.kp * error;
+      debug_i = _pid.ki * integrator;
+
+      output = _pid.ks + debug_f + debug_p + debug_i;
+    } else {
+      debug_f = 0;
+      debug_p = 0;
+      debug_i = 0;
     }
+
+    debug_out = output;  // Store unconstrained output
 
     int pwm = (int)constrain(round(output), 0.0, 255.0);
 
@@ -225,19 +240,18 @@ class WheelController {
 WebsocketsClient wsClient;
 bool cameraReady = false;
 uint32_t frameSequence = 0;
-
 // Instantiate Left Wheel
 WheelController leftWheel(TUNING_L, PWM_CHAN_L, PIN_PWM_L, PIN_IN1_L, PIN_IN2_L,
                           PIN_ENC_L);
 
-// Instantiate Right Wheel (Commented)
-// WheelController rightWheel(TUNING_R, PWM_CHAN_R, PIN_PWM_R, PIN_IN1_R,
-// PIN_IN2_R, PIN_ENC_R);
+// Instantiate Right Wheel
+WheelController rightWheel(TUNING_R, PWM_CHAN_R, PIN_PWM_R, PIN_IN1_R,
+                           PIN_IN2_R, PIN_ENC_R);
 
 // ISR Wrappers (Required because we can't attach class methods directly to
 // interrupts)
 void IRAM_ATTR isrLeft() { leftWheel.handleInterrupt(); }
-// void IRAM_ATTR isrRight() { rightWheel.handleInterrupt(); }
+void IRAM_ATTR isrRight() { rightWheel.handleInterrupt(); }
 
 //
 
@@ -264,8 +278,9 @@ void handleIncomingJson(String data) {
 
   if (doc["type"] == "command") {
     leftWheel.targetSpeed = doc["left"] | 0.0;
-    // rightWheel.targetSpeed = doc["right"] | 0.0;
+    rightWheel.targetSpeed = doc["right"] | 0.0;
     Serial.printf("Target Left: %.3f\n", leftWheel.targetSpeed);
+    Serial.printf("Target Right: %.3f\n", rightWheel.targetSpeed);
   }
 }
 
@@ -281,6 +296,42 @@ void manageWebSocket() {
     Serial.printf("WS Connect: %s:%d\n", WS_HOST, WS_PORT);
     wsClient.connect(WS_HOST, WS_PORT, WS_PATH);
   }
+}
+
+// debugging control
+
+void sendDebug() {
+  static unsigned long lastTime = 0;
+  unsigned long now = millis();
+  if (now - lastTime < DEBUG_PERIOD_MS) return;
+  lastTime = now;
+
+  if (!wsClient.available()) return;
+
+  // Use a smaller JSON structure to save bandwidth
+  JsonDocument doc;
+  doc["type"] = "pid_log";
+  doc["ts"] = now;
+
+  // Left Wheel Data
+  JsonObject l = doc["left"].to<JsonObject>();
+  l["t"] = leftWheel.targetSpeed;    // Target
+  l["m"] = leftWheel.measuredSpeed;  // Measured
+  l["pwm"] = leftWheel.debug_out;    // Total Output
+  l["p"] = leftWheel.debug_p;        // Proportional term
+  l["i"] = leftWheel.debug_i;        // Integral term
+
+  // Right Wheel Data
+  JsonObject r = doc["right"].to<JsonObject>();
+  r["t"] = rightWheel.targetSpeed;    // Target
+  r["m"] = rightWheel.measuredSpeed;  // Measured
+  r["pwm"] = rightWheel.debug_out;    // Total Output
+  r["p"] = rightWheel.debug_p;        // Proportional term
+  r["i"] = rightWheel.debug_i;        // Integral term
+
+  String payload;
+  serializeJson(doc, payload);
+  wsClient.send(payload);
 }
 
 //
@@ -306,9 +357,11 @@ void sendTelemetry() {
   l["target"] = leftWheel.targetSpeed;
   l["int"] = leftWheel.integrator;
 
-  // Commented Right Wheel Telemetry
-  // JsonObject r = doc["right"].to<JsonObject>();
-  // r["speed"] = rightWheel.measuredSpeed; ...
+  JsonObject r = doc["right"].to<JsonObject>();
+  r["speed"] = rightWheel.measuredSpeed;
+  r["rpm"] = rightWheel.measuredRpm;
+  r["target"] = rightWheel.targetSpeed;
+  r["int"] = rightWheel.integrator;
 
   String payload;
   serializeJson(doc, payload);
@@ -320,6 +373,12 @@ void sendTelemetry() {
   Serial.printf("Left RPM: %.3f\n", leftWheel.measuredRpm);
   Serial.printf("Left Target: %.3f\n", leftWheel.targetSpeed);
   Serial.printf("Left Integrator: %.3f\n", leftWheel.integrator);
+
+  Serial.printf("Right Instant Speed: %.3f\n", rightWheel.rawSpeed);
+  Serial.printf("Right Filtered Speed: %.3f\n", rightWheel.measuredSpeed);
+  Serial.printf("Right RPM: %.3f\n", rightWheel.measuredRpm);
+  Serial.printf("Right Target: %.3f\n", rightWheel.targetSpeed);
+  Serial.printf("Right Integrator: %.3f\n", rightWheel.integrator);
 }
 
 void setupCamera() {
@@ -340,8 +399,8 @@ void setupCamera() {
   config.pin_pclk = CAM_PIN_PCLK;
   config.pin_vsync = CAM_PIN_VSYNC;
   config.pin_href = CAM_PIN_HREF;
-  config.pin_sscb_sda = CAM_PIN_SIOD;
-  config.pin_sscb_scl = CAM_PIN_SIOC;
+  config.pin_sccb_sda = CAM_PIN_SIOD;
+  config.pin_sccb_scl = CAM_PIN_SIOC;
   config.pin_pwdn = CAM_PIN_PWDN;
   config.pin_reset = CAM_PIN_RESET;
 
@@ -427,12 +486,10 @@ void setup() {
 
   // Hardware Setup
   leftWheel.begin();
+  attachInterrupt(digitalPinToInterrupt(leftWheel.pinEnc), isrLeft, CHANGE);
 
-  attachInterrupt(digitalPinToInterrupt(PIN_ENC_L), isrLeft, RISING);
-
-  // rightWheel.begin();
-  // attachInterrupt(digitalPinToInterrupt(rightWheel.pinEnc), isrRight,
-  // RISING);
+  rightWheel.begin();
+  attachInterrupt(digitalPinToInterrupt(rightWheel.pinEnc), isrRight, CHANGE);
 
   connectWiFi();
 
@@ -465,10 +522,11 @@ void loop() {
     unsigned long dt = now - lastControl;
     lastControl = now;
     leftWheel.update(dt);
-    // rightWheel.update(dt);
+    rightWheel.update(dt);
   }
 
   // 3. Reporting
+  sendDebug();
   sendTelemetry();
   // streamCamera(now);
 }

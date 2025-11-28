@@ -2,20 +2,27 @@
 
 // #define diam 50 /* Em mm */
 // #define EncoderPin 18
-// #define dt_ms 200 /* Delay para medir o tempo */
+// #define dt_ms 2000 /* Delay para medir o tempo */
 // #define PI 3.1415f
 // #define PULSES_PER_ROT 64.0f
 
 // #define IN1 16
 // #define IN2 17
 // #define ENA 15
+// unsigned long lastInterruptTime = 0;
+// #define DEBOUNCE_MICROS 1000
 
-// volatile int encoder = 0; /* Medicao atual do encoder */
+// volatile unsigned long encoder = 0; /* Medicao atual do encoder */
 // float rotacoes = 0;
 // float vel = 0;
 // unsigned long t = 0;
 
-// void IRAM_ATTR encoder_inc() { encoder++; }
+// void IRAM_ATTR encoder_inc() {
+//   if (micros() - lastInterruptTime > DEBOUNCE_MICROS) {
+//     encoder++;
+//     lastInterruptTime = micros();
+//   }
+// }
 
 // void setup() {
 //   delay(3000);

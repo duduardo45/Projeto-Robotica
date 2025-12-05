@@ -6,48 +6,48 @@
 
 #include "camera_pins.h"
 #include "credentials.h"
-
+// DO NOT DO NEOPIXEL WRITE BECAUSE WE COULD BE USING ITS PIN
 //
 // CONFIGURATION
 //
 
 // --- Networking ---
 const char *WS_HOST = "192.168.0.146";
+// const char *WS_HOST = "10.233.189.135";
 const uint16_t WS_PORT = 8000;
 const char *WS_PATH = "/ws/robot";
-const unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
+const int64_t WS_RECONNECT_INTERVAL_MICROS = 5e6;
 
 // --- Physics & Tuning ---
 // Left Wheel
-#define PIN_ENC_L 18
-#define PIN_PWM_L 15
-#define PIN_IN1_L 16
-#define PIN_IN2_L 17
+#define PIN_ENC_L 21
+#define PIN_PWM_L 1
+#define PIN_IN1_L 44
+#define PIN_IN2_L 2
 #define PWM_CHAN_L 2  // Channel 0 is taken by Camera! Using 2.
-#define TUNING_L {100.0, 45.0, 120.0, 20.0}  // {ks, kf, kp, ki}
+#define TUNING_L {70.0, 10.0, 40.0, 30.0}  // {ks, kf, kp, ki}
 
-// Right Wheel
-#define PIN_ENC_R 7
+// Right Wheel. it has a bigger ks because it has more static friction
+#define PIN_ENC_R 47
 #define PIN_PWM_R 42
 #define PIN_IN1_R 41
-#define PIN_IN2_R 6
+#define PIN_IN2_R 48
 #define PWM_CHAN_R 3
-#define TUNING_R {140.0, 30.0, 120.0, 20.0}
+#define TUNING_R {120.0, 10.0, 40.0, 30.0}
 
 #define WHEEL_RADIUS_MM 49.67
 #define PULSES_PER_ROT 64.0
 #define PWM_LIMITS {0, 255}
 #define SPEED_DEADBAND 0.01
-#define INTEGRATOR_CLAMP 5.0
+#define INTEGRATOR_CLAMP 6.0
 // SPEED_FILTER_ALPHA the lower you make it, the slower is the exponential
 // average:
-#define SPEED_FILTER_ALPHA 0.2
+#define SPEED_FILTER_ALPHA 0.1
 
 // --- Timing ---
-#define CONTROL_PERIOD_MS 40  // testar isso, menor nem sempre é melhor
-#define DEBUG_PERIOD_MS 50
-#define TELEMETRY_PERIOD_MS 500
-#define FRAME_STREAM_PERIOD_MS 200
+#define CONTROL_PERIOD_MICROS 200e3
+#define TELEMETRY_PERIOD_MICROS 50e3
+#define FRAME_STREAM_PERIOD_MICROS 50e3
 #define PWM_FREQ 5000
 #define PWM_RES 8
 
@@ -90,9 +90,9 @@ class WheelController {
   unsigned long lastEncoderCount = 0;
 
   double targetSpeed = 0.0;    // m/s
-  double measuredSpeed = 0.0;  // m/s (filtered)
+  double filteredSpeed = 0.0;  // m/s (filtered)
   double rawSpeed = 0.0;       // m/s (instant)
-  double measuredRpm = 0.0;
+  double filteredRpm = 0.0;
   double integrator = 0.0;
 
   double debug_p = 0;
@@ -136,7 +136,7 @@ class WheelController {
     integrator = 0;
   }
 
-  void update(unsigned long nowMs) {
+  void update(int64_t nowMicros) {
     // 1. Atomic Encoder Read
     unsigned long currentCount;
     noInterrupts();
@@ -144,8 +144,8 @@ class WheelController {
     interrupts();
 
     // 2. High Precision Time Calculation
-    unsigned long currentMicros = micros();
-    unsigned long dtMicros = currentMicros - lastMicros;
+    int64_t currentMicros = esp_timer_get_time();
+    int64_t dtMicros = currentMicros - lastMicros;
     lastMicros = currentMicros;  // Update this immediately
 
     // Sanity check (prevent divide by zero or overflow on first run)
@@ -169,7 +169,7 @@ class WheelController {
       // If > 100ms (0.1s), force speed to 0.
       if ((currentMicros - lastPulseMicros) > 100000) {
         instantSpeed = 0.0;
-        measuredSpeed = 0.0;  // Force filter reset
+        filteredSpeed = 0.0;  // Force filter reset
       } else {
         // We haven't moved *this* X ms, but we moved recently.
         // Keep instantSpeed as 0, but let the Low Pass Filter
@@ -181,10 +181,10 @@ class WheelController {
     rawSpeed = instantSpeed;
 
     // 4. Low Pass Filter
-    measuredSpeed = (SPEED_FILTER_ALPHA * instantSpeed) +
-                    ((1.0 - SPEED_FILTER_ALPHA) * measuredSpeed);
+    filteredSpeed = (SPEED_FILTER_ALPHA * instantSpeed) +
+                    ((1.0 - SPEED_FILTER_ALPHA) * filteredSpeed);
 
-    measuredRpm = (measuredSpeed / _metersPerPulse) * 60.0 / PULSES_PER_ROT;
+    filteredRpm = (filteredSpeed / _metersPerPulse) * 60.0 / PULSES_PER_ROT;
 
     // 5. Control Logic
     bool forward = (targetSpeed >= 0);
@@ -192,7 +192,7 @@ class WheelController {
     digitalWrite(pinIn2, forward ? LOW : HIGH);
 
     double targetAbs = fabs(targetSpeed);
-    double error = targetAbs - measuredSpeed;
+    double error = targetAbs - filteredSpeed;
 
     // Integral Anti-windup
     if (targetAbs < SPEED_DEADBAND) {
@@ -228,8 +228,8 @@ class WheelController {
  private:
   PidConfig _pid;
   double _metersPerPulse;
-  unsigned long lastMicros = 0;
-  unsigned long lastPulseMicros = 0;
+  int64_t lastMicros = 0;
+  int64_t lastPulseMicros = 0;
 };
 
 //
@@ -285,53 +285,17 @@ void handleIncomingJson(String data) {
 }
 
 void manageWebSocket() {
-  static unsigned long lastAttempt = 0;
+  static int64_t lastAttempt = 0;
   if (wsClient.available()) {
     wsClient.poll();
     return;
   }
 
-  if (millis() - lastAttempt > WS_RECONNECT_INTERVAL_MS) {
-    lastAttempt = millis();
+  if (esp_timer_get_time() - lastAttempt > WS_RECONNECT_INTERVAL_MICROS) {
+    lastAttempt = esp_timer_get_time();
     Serial.printf("WS Connect: %s:%d\n", WS_HOST, WS_PORT);
     wsClient.connect(WS_HOST, WS_PORT, WS_PATH);
   }
-}
-
-// debugging control
-
-void sendDebug() {
-  static unsigned long lastTime = 0;
-  unsigned long now = millis();
-  if (now - lastTime < DEBUG_PERIOD_MS) return;
-  lastTime = now;
-
-  if (!wsClient.available()) return;
-
-  // Use a smaller JSON structure to save bandwidth
-  JsonDocument doc;
-  doc["type"] = "pid_log";
-  doc["ts"] = now;
-
-  // Left Wheel Data
-  JsonObject l = doc["left"].to<JsonObject>();
-  l["t"] = leftWheel.targetSpeed;    // Target
-  l["m"] = leftWheel.measuredSpeed;  // Measured
-  l["pwm"] = leftWheel.debug_out;    // Total Output
-  l["p"] = leftWheel.debug_p;        // Proportional term
-  l["i"] = leftWheel.debug_i;        // Integral term
-
-  // Right Wheel Data
-  JsonObject r = doc["right"].to<JsonObject>();
-  r["t"] = rightWheel.targetSpeed;    // Target
-  r["m"] = rightWheel.measuredSpeed;  // Measured
-  r["pwm"] = rightWheel.debug_out;    // Total Output
-  r["p"] = rightWheel.debug_p;        // Proportional term
-  r["i"] = rightWheel.debug_i;        // Integral term
-
-  String payload;
-  serializeJson(doc, payload);
-  wsClient.send(payload);
 }
 
 //
@@ -342,43 +306,40 @@ void sendDebug() {
 void sendTelemetry() {
   if (!wsClient.available()) return;
 
-  static unsigned long lastTime = 0;
-  unsigned long now = millis();
-  if (now - lastTime < TELEMETRY_PERIOD_MS) return;
+  static int64_t lastTime = 0;
+  int64_t now = esp_timer_get_time();
+  if (now - lastTime < TELEMETRY_PERIOD_MICROS) return;
   lastTime = now;
 
   JsonDocument doc;
-  doc["type"] = "telemetry";
+  doc["message_type"] = "telemetry";
   doc["timestamp"] = now;
 
-  JsonObject l = doc["left"].to<JsonObject>();
-  l["speed"] = leftWheel.measuredSpeed;
-  l["rpm"] = leftWheel.measuredRpm;
-  l["target"] = leftWheel.targetSpeed;
-  l["int"] = leftWheel.integrator;
+  JsonObject left = doc["left"].to<JsonObject>();
+  left["encoder"] = leftWheel.encoderCount;
+  left["raw_speed"] = leftWheel.rawSpeed;
+  left["filtered_speed"] = leftWheel.filteredSpeed;
+  left["target_speed"] = leftWheel.targetSpeed;
 
-  JsonObject r = doc["right"].to<JsonObject>();
-  r["speed"] = rightWheel.measuredSpeed;
-  r["rpm"] = rightWheel.measuredRpm;
-  r["target"] = rightWheel.targetSpeed;
-  r["int"] = rightWheel.integrator;
+  left["debug_f"] = leftWheel.debug_f;
+  left["debug_p"] = leftWheel.debug_p;
+  left["debug_i"] = leftWheel.debug_i;
+  left["debug_out"] = leftWheel.debug_out;
+
+  JsonObject right = doc["right"].to<JsonObject>();
+  right["encoder"] = rightWheel.encoderCount;
+  right["raw_speed"] = rightWheel.rawSpeed;
+  right["filtered_speed"] = rightWheel.filteredSpeed;
+  right["target_speed"] = rightWheel.targetSpeed;
+
+  right["debug_f"] = rightWheel.debug_f;
+  right["debug_p"] = rightWheel.debug_p;
+  right["debug_i"] = rightWheel.debug_i;
+  right["debug_out"] = rightWheel.debug_out;
 
   String payload;
   serializeJson(doc, payload);
   wsClient.send(payload);
-
-  Serial.printf("Telemetry Sent: %s\n", payload.c_str());
-  Serial.printf("Left Instant Speed: %.3f\n", leftWheel.rawSpeed);
-  Serial.printf("Left Filtered Speed: %.3f\n", leftWheel.measuredSpeed);
-  Serial.printf("Left RPM: %.3f\n", leftWheel.measuredRpm);
-  Serial.printf("Left Target: %.3f\n", leftWheel.targetSpeed);
-  Serial.printf("Left Integrator: %.3f\n", leftWheel.integrator);
-
-  Serial.printf("Right Instant Speed: %.3f\n", rightWheel.rawSpeed);
-  Serial.printf("Right Filtered Speed: %.3f\n", rightWheel.measuredSpeed);
-  Serial.printf("Right RPM: %.3f\n", rightWheel.measuredRpm);
-  Serial.printf("Right Target: %.3f\n", rightWheel.targetSpeed);
-  Serial.printf("Right Integrator: %.3f\n", rightWheel.integrator);
 }
 
 void setupCamera() {
@@ -399,20 +360,27 @@ void setupCamera() {
   config.pin_pclk = CAM_PIN_PCLK;
   config.pin_vsync = CAM_PIN_VSYNC;
   config.pin_href = CAM_PIN_HREF;
-  config.pin_sccb_sda = CAM_PIN_SIOD;
-  config.pin_sccb_scl = CAM_PIN_SIOC;
+  config.pin_sccb_sda = CAM_PIN_SCCB_SDA;
+  config.pin_sccb_scl = CAM_PIN_SCCB_SCL;
   config.pin_pwdn = CAM_PIN_PWDN;
   config.pin_reset = CAM_PIN_RESET;
 
-  // 2. Signal Clock & Format
   config.xclk_freq_hz = 20000000;  // 20MHz XCLK
-  config.pixel_format = PIXFORMAT_GRAYSCALE;
 
-  // 3. Frame Settings
-  config.frame_size = FRAMESIZE_QVGA;
+  // config.pixel_format = PIXFORMAT_GRAYSCALE;
 
-  config.fb_count = 1;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
+  // // 3. Frame Settings
+  // config.frame_size = FRAMESIZE_QVGA;
+
+  // config.fb_count = 1;
+  // config.fb_location = CAMERA_FB_IN_PSRAM;
+  // config.grab_mode = CAMERA_GRAB_LATEST;
+
+  config.pixel_format = PIXFORMAT_JPEG;  // Was PIXFORMAT_GRAYSCALE
+  config.frame_size = FRAMESIZE_QVGA;    // 320x240
+  config.jpeg_quality =
+      12;               // 0-63. 10-12 is good balance. Lower is higher quality.
+  config.fb_count = 2;  // Use 2 buffers for smoother streaming
   config.grab_mode = CAMERA_GRAB_LATEST;
 
   // 4. Initialize
@@ -431,22 +399,27 @@ void setupCamera() {
   Serial.println("Camera Configured Successfully");
 }
 
-void streamCamera(unsigned long now) {
-  static unsigned long lastFrame = 0;
+void streamCamera(int64_t now) {
+  static int64_t lastFrame = 0;
 
-  // Basic throttle and readiness checks
+  // 1. Throttle check
   if (!cameraReady || !wsClient.available() ||
-      (now - lastFrame < FRAME_STREAM_PERIOD_MS))
+      (now - lastFrame < FRAME_STREAM_PERIOD_MICROS))
     return;
+
+  // --- START TIMING ---
+  int64_t t_start = esp_timer_get_time();
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
 
-  if (fb->format == PIXFORMAT_GRAYSCALE) {
+  int64_t t_captured = esp_timer_get_time();  // Time after capture
+
+  // if (fb->format == PIXFORMAT_GRAYSCALE) {
+  if (fb->format == PIXFORMAT_JPEG) {
     size_t hSize = sizeof(FramePacketHeader);
     size_t totalSize = hSize + fb->len;
 
-    // Allocate buffer for Header + Raw Data
     uint8_t *packet = (uint8_t *)malloc(totalSize);
 
     if (packet) {
@@ -463,10 +436,32 @@ void streamCamera(unsigned long now) {
       // Copy raw grayscale data
       memcpy(packet + hSize, fb->buf, fb->len);
 
+      int64_t t_copied = esp_timer_get_time();  // Time after memory copy
+
+      // Send data
       wsClient.sendBinary((const char *)packet, totalSize);
+
+      int64_t t_sent = esp_timer_get_time();  // Time after network send
 
       free(packet);
       lastFrame = now;
+
+      // --- PRINT DIAGNOSTICS ---
+      // Serial.printf(
+      //     "TIMING (ms) -> Capture: %lu | Copy: %lu | Network: %lu | Total: "
+      //     "%lu\n",
+      //     (t_captured - t_start),   // How long the camera took to give a
+      //     frame (t_copied - t_captured),  // How long malloc + memcpy took
+      //     (t_sent - t_copied),      // How long WiFi took to push data
+      //     (t_sent - t_start)        // Total time blocked
+      // );
+      Serial.printf(
+          "JPEG TIMING (us) -> Capture: %lu | Copy: %lu | Network: %lu | "
+          "Total: %lu | Size: %u bytes\n",
+          (t_captured - t_start), (t_copied - t_captured), (t_sent - t_copied),
+          (t_sent - t_start),
+          fb->len  // Look at how small this number is now!
+      );
     } else {
       Serial.println("Camera Malloc Failed");
     }
@@ -480,7 +475,6 @@ void streamCamera(unsigned long now) {
 //
 
 void setup() {
-  neopixelWrite(RGB_BUILTIN, 50, 0, 50);  // Purple
   Serial.begin(115200);
   delay(1000);
 
@@ -493,40 +487,30 @@ void setup() {
 
   connectWiFi();
 
-  // setupCamera();
+  setupCamera();
 
   // WebSocket Callbacks
   wsClient.onMessage([](WebsocketsMessage msg) {
     if (msg.isText()) handleIncomingJson(msg.data());
   });
-
-  wsClient.onEvent([](WebsocketsEvent event, String data) {
-    if (event == WebsocketsEvent::ConnectionOpened) {
-      Serial.println("WS Connected");
-      wsClient.send("{\"type\":\"hello\",\"role\":\"esp32\"}");
-    }
-  });
-
-  neopixelWrite(RGB_BUILTIN, 0, 50, 0);  // Green
 }
 
 void loop() {
-  unsigned long now = millis();
+  int64_t now = esp_timer_get_time();
 
   // 1. Network
   manageWebSocket();
 
   // 2. Control Loop
-  static unsigned long lastControl = 0;
-  if (now - lastControl >= CONTROL_PERIOD_MS) {
-    unsigned long dt = now - lastControl;
+  static int64_t lastControl = 0;
+  if (now - lastControl >= CONTROL_PERIOD_MICROS) {
+    int64_t dt = now - lastControl;
     lastControl = now;
     leftWheel.update(dt);
     rightWheel.update(dt);
   }
 
   // 3. Reporting
-  sendDebug();
   sendTelemetry();
-  // streamCamera(now);
+  streamCamera(now);
 }

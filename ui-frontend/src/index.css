@@ -1,0 +1,10 @@
+/* Minimal global styles, Chakra handles most layout and theming */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}

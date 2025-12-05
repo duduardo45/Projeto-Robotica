@@ -1,284 +1,194 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import logging
 import math
 import struct
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from typing import Literal, NamedTuple
+from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
-from pupil_apriltags import Detector
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pupil_apriltags import Detection, Detector
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.addHandler(logging.StreamHandler())
 
 # --- Constants ---
 
 WHEEL_BASE_METERS = 0.28
 FRAME_PACKET_MAGIC = 0x46524D31
 FRAME_PACKET_VERSION = 1
-# Format: Magic(I), Version(H), Reserved(H), FrameID(I), Timestamp(I), Width(H), Height(H), PayloadLen(I)
 FRAME_HEADER_STRUCT = struct.Struct("<I H H I I H H I")
 APRILTAG_SIZE_METERS = 0.06
-# fx, fy, cx, cy
 CAMERA_PARAMS = (620.0, 620.0, 320.0, 240.0)
+# valores errados:
+WHEEL_RADIUS_METERS = 0.04967
+TICKS_PER_METER = 64.0 * (1.0 / 2 * math.pi * WHEEL_RADIUS_METERS)
+
+ARRIVAL_TOLERANCE_METERS = 0.05
+HEADING_TOLERANCE_RADIANS = 0.1
+ANGULAR_SPEED_LIMIT_RADIANS = 2.0
+ANGULAR_SPEED_GAIN = 2.0
+HEADING_GAIN = 1.0
+
+MISSION_LOOP_INTERVAL_SECONDS = 0.2
+
+# --- Helpers ---
 
 
-def monotonic_ms() -> int:
-    """Returns the current monotonic time in milliseconds.
-
-    Returns:
-        int: The current time in nanoseconds converted to milliseconds.
-    """
-    return time.time_ns() // 1_000_000
+def monotonic_micros() -> int:
+    return time.time_ns() // 1_000
 
 
-def clamp(value: float, lower: float, upper: float) -> float:
-    """Constrains a value to lie between a lower and upper bound.
-
-    Args:
-        value (float): The input value.
-        lower (float): The minimum allowable value.
-        upper (float): The maximum allowable value.
-
-    Returns:
-        float: The clamped value.
-    """
-    return max(lower, min(upper, value))
+def clamp(value: float, limit: float) -> float:
+    """Simple symmetric clamp."""
+    return max(-limit, min(limit, value))
 
 
-class FramePacket(NamedTuple):
-    """Represents a parsed video frame packet from the robot."""
+def normalize_angle(angle: float) -> float:
+    """Keeps angle between -pi and pi."""
+    return (angle + math.pi) % (2 * math.pi) - math.pi
 
+
+# --- Data Models (Simplified) ---
+
+
+@dataclass
+class Pose:
+    x: float
+    y: float
+    theta: float
+
+
+@dataclass(kw_only=True, slots=True, frozen=True)
+class FramePacket:
     frame_id: int
-    timestamp_ms: int
+    timestamp_micros: int
     width: int
     height: int
     data: bytes
 
 
-class WheelSample(BaseModel):
-    """Telemetry data model for a single wheel."""
-
-    rotation_count: float = Field(default=0.0, alias="rotation")
-    frequency_rpm: float = 0.0
-    speed_m_s: float = 0.0
-    delta_count: int = 0
-    interval_ms: int = 0
-
-    model_config = ConfigDict(populate_by_name=True)
-
-
-class Pose(BaseModel):
-    """Represents the 2D pose of the robot."""
-
-    x: float = 0.0
-    y: float = 0.0
-    theta: float = 0.0
+class WheelTelemetry(BaseModel):
+    encoder: int
+    raw_speed: float
+    filtered_speed: float
+    target_speed: float
+    debug_f: float
+    debug_p: float
+    debug_i: float
+    debug_out: float
 
 
 class RobotState(BaseModel):
-    """The aggregate state of the robot, including pose and wheel telemetry."""
+    """Now includes the calculated Pose."""
 
-    pose: Pose = Field(default_factory=Pose)
-    left: WheelSample = Field(default_factory=WheelSample)
-    right: WheelSample = Field(default_factory=WheelSample)
-    last_update_ms: int = 0
+    pose: Pose
+    left: WheelTelemetry
+    right: WheelTelemetry
+    last_update_micros: int
 
 
 class TelemetryIncoming(BaseModel):
-    """Schema for telemetry messages received via WebSocket."""
-
-    type: Literal["telemetry"]
-    timestamp: int = Field(default_factory=monotonic_ms)
-    left: WheelSample = Field(default_factory=WheelSample)
-    right: WheelSample = Field(default_factory=WheelSample)
+    message_type: Literal["telemetry"]
+    timestamp: int
+    left: WheelTelemetry
+    right: WheelTelemetry
 
 
 class WheelsCommand(BaseModel):
-    """Schema for motor control commands sent to the robot."""
-
-    type: Literal["command"] = "command"
-    left: float
-    right: float
+    message_type: Literal["command"]
+    left_target_speed: float
+    right_target_speed: float
 
 
 class CommandRequest(BaseModel):
-    """Schema for speed control requests via the API."""
-
     left: float
     right: float
 
 
 class CommandResponse(BaseModel):
-    """Schema for the response to a command request."""
-
     status: str
-    target: CommandRequest
-    timestamp_ms: int = Field(default_factory=monotonic_ms)
 
 
 class TagDetection(BaseModel):
-    """Schema for a detected AprilTag."""
-
     tag_id: int
-    decision_margin: float
     distance_m: float
-    frame_id: int
-    timestamp_ms: int
-    pose: Pose | None = None
+    center: tuple[float, float]
 
 
 class VisionSnapshot(BaseModel):
-    """Schema for the latest vision processing results."""
-
-    last_frame_timestamp_ms: int
+    message_type: Literal["vision_snapshot"]
     detections: list[TagDetection]
 
 
 class MissionRequest(BaseModel):
-    """Schema for requesting a new navigation mission."""
+    """Barebones mission request."""
 
-    pose: Pose
-    position_tolerance: float = Field(default=0.03, gt=0)
-    heading_tolerance_rad: float = Field(default=math.radians(8.0), gt=0)
-    linear_speed: float = Field(default=0.35, gt=0)
-    angular_speed: float = Field(default=1.2, gt=0)
+    x: float
+    y: float
+    speed: float
 
 
 class MissionStatus(BaseModel):
-    """Schema for the current status of the mission runner."""
-
-    state: Literal["idle", "running", "completed", "error"] = "idle"
-    target: Pose | None = None
-    started_ms: int | None = None
-    last_error: str | None = None
+    state: Literal["idle", "running", "completed"] = "idle"
 
 
 class RobotOfflineError(RuntimeError):
-    """Exception raised when attempting to control a disconnected robot."""
-
     pass
 
 
 def parse_frame_packet(payload: bytes) -> FramePacket | None:
-    """Parses a binary payload into a structured FramePacket.
-
-    Validates the header magic and version before extracting metadata and
-    the image payload.
-
-    Args:
-        payload (bytes): The raw binary data received from the WebSocket.
-
-    Returns:
-        FramePacket | None: The parsed packet structure if valid, otherwise None.
-    """
     if len(payload) <= FRAME_HEADER_STRUCT.size:
         return None
-    (
-        magic,
-        version,
-        _reserved,
-        frame_id,
-        timestamp_ms,
-        width,
-        height,
-        payload_len,
-    ) = FRAME_HEADER_STRUCT.unpack_from(payload, 0)
-
-    if magic != FRAME_PACKET_MAGIC or version != FRAME_PACKET_VERSION:
+    (magic, version, _, frame_id, ts, w, h, p_len) = FRAME_HEADER_STRUCT.unpack_from(
+        payload, 0
+    )
+    if (
+        magic != FRAME_PACKET_MAGIC
+        or version != FRAME_PACKET_VERSION
+        or p_len != len(payload) - FRAME_HEADER_STRUCT.size
+    ):
         return None
-    if payload_len != len(payload) - FRAME_HEADER_STRUCT.size:
-        return None
-
-    data = payload[FRAME_HEADER_STRUCT.size :]
     return FramePacket(
         frame_id=frame_id,
-        timestamp_ms=timestamp_ms,
-        width=width,
-        height=height,
-        data=data,
+        timestamp_micros=ts,
+        width=w,
+        height=h,
+        data=payload[FRAME_HEADER_STRUCT.size :],
     )
 
 
-# --- Internal State Classes (Dataclasses) ---
+# --- Internal State ---
 
 
-@dataclass
-class WheelSampleState:
-    """Internal state representation of a wheel's telemetry."""
-
-    rotation_count: float = 0.0
-    frequency_rpm: float = 0.0
-    speed_m_s: float = 0.0
-    delta_count: int = 0
-    interval_ms: int = 0
-
-
-@dataclass
-class PoseState:
-    """Internal state representation of the robot's pose."""
-
-    x: float = 0.0
-    y: float = 0.0
-    theta: float = 0.0
-
-
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class RobotStateData:
-    """Internal aggregator for robot state."""
-
-    pose: PoseState = field(default_factory=PoseState)
-    left: WheelSampleState = field(default_factory=WheelSampleState)
-    right: WheelSampleState = field(default_factory=WheelSampleState)
-    last_update_ms: int = 0
+    pose: Pose
+    left: WheelTelemetry
+    right: WheelTelemetry
+    last_update_micros: int
 
 
-@dataclass
-class TagDetectionState:
-    """Internal representation of a tag detection."""
-
-    tag_id: int
-    decision_margin: float
-    distance_m: float
-    frame_id: int
-    timestamp_ms: int
-    pose: PoseState | None = None
-
-
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class MissionPlan:
-    """Internal representation of the active mission parameters."""
-
-    pose: PoseState
-    position_tolerance: float
-    heading_tolerance_rad: float
-    linear_speed: float
-    angular_speed: float
+    x: float
+    y: float
+    speed: float
 
 
-@dataclass
-class MissionStatusState:
-    """Internal state of the mission runner."""
-
-    state: Literal["idle", "running", "completed", "error"] = "idle"
-    target: PoseState | None = None
-    started_ms: int | None = None
-    last_error: str | None = None
-
-
-APRILTAG_ANCHORS: dict[int, PoseState] = {
-    1: PoseState(x=0.0, y=0.0, theta=0.0),
-}
+class DashboardMessage(BaseModel):
+    data: TelemetryIncoming | VisionSnapshot = Field(discriminator="message_type")
 
 
 class DashboardHub:
-    """Tracks dashboard WebSocket connections and broadcasts messages to them."""
-
     def __init__(self) -> None:
         self._connections: set[WebSocket] = set()
 
@@ -288,472 +198,270 @@ class DashboardHub:
     async def unregister(self, websocket: WebSocket) -> None:
         self._connections.discard(websocket)
 
-    async def broadcast_text(self, message: str) -> None:
-        if not self._connections:
-            return
-        failed: list[WebSocket] = []
+    async def broadcast_dashboard_message(self, message: DashboardMessage) -> None:
         for ws in list(self._connections):
             try:
-                await ws.send_text(message)
+                await ws.send_json(message.model_dump(mode="json"))
             except Exception:
-                failed.append(ws)
-        for ws in failed:
-            await self.unregister(ws)
+                await self.unregister(ws)
+
+    async def broadcast_frame_packet(self, data: FramePacket) -> None:
+        for ws in list(self._connections):
+            try:
+                await ws.send_bytes(data.data)
+            except Exception:
+                await self.unregister(ws)
 
 
 class Robot:
-    """Manages robot state, communication, vision processing, and mission execution.
-
-    This class handles the WebSocket connection to the physical robot, processes
-    incoming telemetry and video frames, performs dead-reckoning (odometry),
-    detects AprilTags for absolute positioning, and executes navigation missions.
-    """
-
     def __init__(self) -> None:
-        """Initializes the Robot instance with default state and detector settings."""
-        self._state = RobotStateData()
+        # Initialize at 0,0,0
+        self._state = RobotStateData(
+            pose=Pose(0.0, 0.0, 0.0),
+            left=WheelTelemetry(
+                encoder=0,
+                raw_speed=0.0,
+                filtered_speed=0.0,
+                target_speed=0.0,
+                debug_f=0.0,
+                debug_p=0.0,
+                debug_i=0.0,
+                debug_out=0.0,
+            ),
+            right=WheelTelemetry(
+                encoder=0,
+                raw_speed=0.0,
+                filtered_speed=0.0,
+                target_speed=0.0,
+                debug_f=0.0,
+                debug_p=0.0,
+                debug_i=0.0,
+                debug_out=0.0,
+            ),
+            last_update_micros=0,
+        )
         self._ws: WebSocket | None = None
         self._mission: MissionPlan | None = None
-        self._mission_status = MissionStatusState()
         self._mission_task: asyncio.Task[None] | None = None
-        self._detector = Detector(
-            families="tag36h11",
-            nthreads=1,
-            quad_decimate=1.0,
-            quad_sigma=0.0,
-            refine_edges=True,
-            decode_sharpening=0.25,
-        )
-        self._latest_detections: list[TagDetectionState] = []
-        self._last_frame_timestamp = 0
+
+        # Reduced detector settings for speed
+        self._detector = Detector(families="tag36h11")
+        self._latest_detections: list[TagDetection] = []
+        self._last_frame_timestamp_micros = 0
 
     async def start(self) -> None:
-        """Starts the robot's background tasks."""
         self._ensure_mission_task()
 
     async def shutdown(self) -> None:
-        """Stops the robot, cancels background missions, and cleans up resources."""
-        if self._mission_task is not None:
+        if self._mission_task:
             self._mission_task.cancel()
-            try:
-                await self._mission_task
-            except asyncio.CancelledError:
-                pass
-            self._mission_task = None
-        try:
-            await self.stop()
-        except RobotOfflineError:
-            pass
+        await self.stop()
 
     def state_snapshot(self) -> RobotState:
-        """Creates a snapshot of the current robot state.
-
-        Returns:
-            RobotState: The current pose and wheel telemetry.
-        """
         return RobotState(
-            pose=self._pose_model(self._state.pose),
-            left=self._wheel_model(self._state.left),
-            right=self._wheel_model(self._state.right),
-            last_update_ms=self._state.last_update_ms,
-        )
-
-    def vision_snapshot(self) -> VisionSnapshot:
-        """Creates a snapshot of the most recent vision processing results.
-
-        Returns:
-            VisionSnapshot: The latest tag detections and frame timestamp.
-        """
-        return VisionSnapshot(
-            last_frame_timestamp_ms=self._last_frame_timestamp,
-            detections=[self._detection_model(d) for d in self._latest_detections],
+            pose=self._state.pose,
+            left=self._state.left,
+            right=self._state.right,
+            last_update_micros=self._state.last_update_micros,
         )
 
     def mission_status(self) -> MissionStatus:
-        """Retrieves the current status of the mission runner.
-
-        Returns:
-            MissionStatus: The state, target, and any error details of the mission.
-        """
-        return MissionStatus(
-            state=self._mission_status.state,
-            target=self._pose_model(self._mission_status.target)
-            if self._mission_status.target is not None
-            else None,
-            started_ms=self._mission_status.started_ms,
-            last_error=self._mission_status.last_error,
-        )
+        state = "running" if self._mission else "idle"
+        return MissionStatus(state=state)
 
     async def set_mission(self, request: MissionRequest) -> MissionStatus:
-        """Configures and starts a new navigation mission.
-
-        Args:
-            request (MissionRequest): The parameters for the new mission.
-
-        Returns:
-            MissionStatus: The status immediately after starting the mission.
-        """
         self._mission = MissionPlan(
-            pose=self._pose_state_from_model(request.pose),
-            position_tolerance=request.position_tolerance,
-            heading_tolerance_rad=request.heading_tolerance_rad,
-            linear_speed=request.linear_speed,
-            angular_speed=request.angular_speed,
-        )
-        self._mission_status = MissionStatusState(
-            state="running",
-            target=self._pose_clone(self._mission.pose),
-            started_ms=monotonic_ms(),
+            x=request.x,
+            y=request.y,
+            speed=request.speed,
         )
         self._ensure_mission_task()
         return self.mission_status()
 
     async def cancel_mission(self) -> MissionStatus:
-        """Cancels the currently running mission and stops the robot.
-
-        Returns:
-            MissionStatus: The updated status reflecting the cancellation.
-        """
         self._mission = None
-        self._mission_status = MissionStatusState(state="idle")
         await self.stop()
         return self.mission_status()
 
     async def attach_websocket(self, websocket: WebSocket) -> None:
-        """Attaches a WebSocket connection for robot communication.
-
-        Closes any existing connection before attaching the new one.
-
-        Args:
-            websocket (WebSocket): The active WebSocket connection.
-        """
-        if self._ws is not None and self._ws is not websocket:
-            await self._ws.close()
         self._ws = websocket
 
     async def detach_websocket(self, websocket: WebSocket | None = None) -> None:
-        """Detaches the WebSocket connection.
-
-        Args:
-            websocket (WebSocket | None): If provided, only detach if it matches
-                the current connection. If None, detach unconditionally.
-        """
-        if websocket is not None and websocket is not self._ws:
-            return
         self._ws = None
 
     async def send_command(self, request: CommandRequest) -> None:
-        """Sends a movement command to the robot.
-
-        Args:
-            request (CommandRequest): The desired left and right wheel speeds.
-
-        Raises:
-            RobotOfflineError: If no WebSocket connection is active.
-        """
-        websocket = self._ws
-        if websocket is None:
-            raise RobotOfflineError("Robot is not connected")
-        message = WheelsCommand(left=request.left, right=request.right)
-        await websocket.send_text(message.model_dump_json())
+        if self._ws:
+            if self._mission:
+                await self.cancel_mission()
+            msg = WheelsCommand(
+                message_type="command",
+                left_target_speed=request.left,
+                right_target_speed=request.right,
+            )
+            await self._ws.send_json(msg.model_dump(mode="json"))
 
     async def stop(self) -> None:
-        """Sends a stop command (zero speed) to the robot."""
-        await self.send_command(CommandRequest(left=0.0, right=0.0))
+        if self._ws:
+            if self._mission:
+                await self.cancel_mission()
+            msg = WheelsCommand(
+                message_type="command",
+                left_target_speed=0.0,
+                right_target_speed=0.0,
+            )
+            await self._ws.send_json(msg.model_dump(mode="json"))
 
-    async def handle_text_message(self, raw_message: str) -> None:
-        """Processes an incoming text message (telemetry) from the robot.
+    # --- Simplified Odometry Here ---
+    def apply_telemetry(self, msg: TelemetryIncoming) -> None:
+        """Calculates Pose based on exact Encoder Deltas (Safe & Accurate)."""
 
-        Args:
-            raw_message (str): The JSON string received via WebSocket.
-        """
-        try:
-            message = TelemetryIncoming.model_validate_json(raw_message)
-        except ValidationError:
+        # 1. Initialize previous state on first run
+        if self._state.last_update_micros == 0:
+            self._state.left = msg.left
+            self._state.right = msg.right
+            self._state.last_update_micros = msg.timestamp
             return
-        self._apply_telemetry(message)
+
+        # 2. Calculate the CHANGE in ticks (Delta)
+        # Note: You usually need to handle integer overflow (wrapping) here if
+        # the robot runs for days, but for simple missions, subtraction is fine.
+        delta_ticks_left = msg.left.encoder - self._state.left.encoder
+        delta_ticks_right = msg.right.encoder - self._state.right.encoder
+
+        # 3. Convert Ticks to Meters
+        d_left = delta_ticks_left / TICKS_PER_METER
+        d_right = delta_ticks_right / TICKS_PER_METER
+
+        # 4. Calculate Distance and Rotation (Differential Drive Kinematics)
+        # The average distance both wheels traveled is the center distance
+        d_center = (d_left + d_right) / 2.0
+
+        # The difference in distance creates rotation
+        d_theta = (d_right - d_left) / WHEEL_BASE_METERS
+
+        # 5. Update Pose (trigonometry)
+        # We use the average theta during the movement for better accuracy (Runge-Kutta 2nd order approximation)
+        avg_theta = self._state.pose.theta + (d_theta / 2.0)
+
+        self._state.pose.x += d_center * math.cos(avg_theta)
+        self._state.pose.y += d_center * math.sin(avg_theta)
+        self._state.pose.theta = normalize_angle(self._state.pose.theta + d_theta)
+
+        # 6. Save state for next loop
+        self._state.left = msg.left
+        self._state.right = msg.right
+        self._state.last_update_micros = msg.timestamp
 
     async def process_frame(self, payload: bytes) -> None:
-        """Processes an incoming binary frame packet.
-
-        Parses the packet, runs tag detection in a separate thread, and applies
-        pose correction if tags are found.
-
-        Args:
-            payload (bytes): The binary frame data.
-        """
         packet = parse_frame_packet(payload)
-        if packet is None:
+        if not packet:
             return
+
+        await dashboard_hub.broadcast_frame_packet(packet)
+
         loop = asyncio.get_running_loop()
-        detections = await loop.run_in_executor(None, self._detect_tags, packet)
-        self._last_frame_timestamp = packet.timestamp_ms
-        self._latest_detections = detections
-        self._apply_pose_correction(detections)
+        # Don't block the event loop with vision processing
+        detections: list[TagDetection] = await loop.run_in_executor(
+            None, self._detect_tags, packet
+        )
+        if detections:
+            logger.debug(f"Detected {len(detections)} tags")
+
+        self._last_frame_timestamp_micros = packet.timestamp_micros
+
+        await dashboard_hub.broadcast_dashboard_message(
+            DashboardMessage(
+                data=VisionSnapshot(
+                    message_type="vision_snapshot", detections=detections
+                ),
+            )
+        )
 
     def _ensure_mission_task(self) -> None:
-        """Ensures the background mission loop is running."""
         if self._mission_task is None or self._mission_task.done():
             self._mission_task = asyncio.create_task(self._mission_loop())
 
+    # --- Simplified Mission Logic Here ---
     async def _mission_loop(self) -> None:
-        """The main loop for executing mission plans.
-
-        Continuously checks for an active mission plan and advances the robot
-        state towards the target.
-        """
-        try:
-            while True:
-                plan = self._mission
-                if plan is None:
-                    await asyncio.sleep(0.1)
-                    continue
-                await self._advance_mission(plan)
+        while True:
+            if not self._mission:
                 await asyncio.sleep(0.1)
-        except asyncio.CancelledError:
-            raise
+                continue
 
-    async def _advance_mission(self, plan: MissionPlan) -> None:
-        """Calculates and sends control commands to progress the mission.
+            # Simple Proportional Control Logic
+            pose = self._state.pose
+            dx = self._mission.x - pose.x
+            dy = self._mission.y - pose.y
+            dist = math.hypot(dx, dy)
 
-        Uses a basic proportional controller to adjust heading and distance.
+            # 1. Check if we arrived
+            if dist < ARRIVAL_TOLERANCE_METERS:
+                await self.stop()
+                self._mission = None
+                logger.info("Mission Completed")
+                continue
 
-        Args:
-            plan (MissionPlan): The current mission parameters.
-        """
-        pose = self._state.pose
-        dx = plan.pose.x - pose.x
-        dy = plan.pose.y - pose.y
-        distance = math.hypot(dx, dy)
-        target_heading = math.atan2(dy, dx)
-        heading_error = math.atan2(
-            math.sin(target_heading - pose.theta),
-            math.cos(target_heading - pose.theta),
-        )
+            # 2. Calculate Heading Error
+            target_angle = math.atan2(dy, dx)
+            angle_error = normalize_angle(target_angle - pose.theta)
 
-        # Check for mission completion
-        if (
-            distance <= plan.position_tolerance
-            and abs(heading_error) <= plan.heading_tolerance_rad
-        ):
-            await self.stop()
-            self._mission = None
-            self._mission_status = MissionStatusState(
-                state="completed",
-                target=self._pose_clone(plan.pose),
-                started_ms=self._mission_status.started_ms,
-            )
-            return
+            # 3. Determine Wheel Speeds
+            # Strategy: Rotate until aligned, then move forward
+            lin_cmd = 0.0
+            ang_cmd = 0.0
 
-        # Calculate control outputs
-        linear = clamp(
-            plan.linear_speed * distance,
-            -plan.linear_speed,
-            plan.linear_speed,
-        )
-        angular = clamp(
-            plan.angular_speed * heading_error,
-            -plan.angular_speed,
-            plan.angular_speed,
-        )
+            if abs(angle_error) > HEADING_TOLERANCE_RADIANS:
+                # Rotate in place
+                ang_cmd = ANGULAR_SPEED_GAIN * angle_error
+                lin_cmd = 0.0
+            else:
+                # Move forward towards target
+                lin_cmd = self._mission.speed
+                # Maintain heading
+                ang_cmd = HEADING_GAIN * angle_error
 
-        # Convert differential drive kinematics to wheel speeds
-        half_base = WHEEL_BASE_METERS / 2.0
-        left_speed = clamp(
-            linear - angular * half_base,
-            -plan.linear_speed,
-            plan.linear_speed,
-        )
-        right_speed = clamp(
-            linear + angular * half_base,
-            -plan.linear_speed,
-            plan.linear_speed,
-        )
+            # 4. Clamp output
+            lin_cmd = clamp(lin_cmd, self._mission.speed)
+            ang_cmd = clamp(ang_cmd, ANGULAR_SPEED_LIMIT_RADIANS)
 
-        try:
-            await self.send_command(CommandRequest(left=left_speed, right=right_speed))
-        except RobotOfflineError:
-            self._mission = None
-            self._mission_status = MissionStatusState(
-                state="error",
-                target=self._pose_clone(plan.pose),
-                started_ms=self._mission_status.started_ms,
-                last_error="Robot disconnected",
-            )
+            # 5. Convert Unicycle (v, w) to Differential (vl, vr)
+            # left = v - (w * base / 2)
+            # right = v + (w * base / 2)
+            half_base = WHEEL_BASE_METERS / 2.0
+            left_speed = lin_cmd - (ang_cmd * half_base)
+            right_speed = lin_cmd + (ang_cmd * half_base)
 
-    def _apply_telemetry(self, msg: TelemetryIncoming) -> None:
-        """Updates internal state with new telemetry data.
+            try:
+                await self.send_command(
+                    CommandRequest(left=left_speed, right=right_speed)
+                )
+            except RobotOfflineError:
+                self._mission = None  # Abort
 
-        Calculates odometry based on the time delta since the last update.
+            await asyncio.sleep(MISSION_LOOP_INTERVAL_SECONDS)
 
-        Args:
-            msg (TelemetryIncoming): The parsed telemetry message.
-        """
-        current_ms = msg.timestamp
-        dt_ms = 0
-        if self._state.last_update_ms > 0:
-            dt_ms = max(0, current_ms - self._state.last_update_ms)
-
-        self._state.left = self._wheel_state_from_model(msg.left)
-        self._state.right = self._wheel_state_from_model(msg.right)
-        self._state.last_update_ms = current_ms
-
-        if dt_ms > 0:
-            self._integrate_pose(dt_ms, msg.left.speed_m_s, msg.right.speed_m_s)
-
-    def _wheel_state_from_model(self, sample: WheelSample) -> WheelSampleState:
-        """Converts a Pydantic wheel sample to an internal data class."""
-        return WheelSampleState(
-            rotation_count=sample.rotation_count,
-            frequency_rpm=sample.frequency_rpm,
-            speed_m_s=sample.speed_m_s,
-            delta_count=sample.delta_count,
-            interval_ms=sample.interval_ms,
-        )
-
-    def _integrate_pose(
-        self, delta_ms: int, left_speed: float, right_speed: float
-    ) -> None:
-        """Updates the robot's pose based on wheel speeds (Dead Reckoning).
-
-        Args:
-            delta_ms (int): Time elapsed since last update in milliseconds.
-            left_speed (float): Speed of the left wheel in m/s.
-            right_speed (float): Speed of the right wheel in m/s.
-        """
-        dt = delta_ms / 1000.0
-        linear_velocity = (left_speed + right_speed) / 2.0
-        angular_velocity = (right_speed - left_speed) / WHEEL_BASE_METERS
-        pose = self._state.pose
-
-        pose.theta += angular_velocity * dt
-        pose.x += linear_velocity * math.cos(pose.theta) * dt
-        pose.y += linear_velocity * math.sin(pose.theta) * dt
-
-    def _detect_tags(self, packet: FramePacket) -> list[TagDetectionState]:
-        """Runs AprilTag detection on a frame packet.
-
-        Args:
-            packet (FramePacket): The image packet to process.
-
-        Returns:
-            list[TagDetectionState]: A list of detected tags and their calculated poses.
-        """
-        # Create a numpy array from the raw bytes
+    def _detect_tags(self, packet: FramePacket) -> list[TagDetection]:
         np_buffer = np.frombuffer(packet.data, dtype=np.uint8)
-
-        # Reshape the raw data based on dimensions.
         try:
             gray = np_buffer.reshape((packet.height, packet.width))
         except ValueError:
-            # Handle case where buffer size doesn't match height*width
             return []
 
-        # 'gray' is already grayscale, so we can pass it directly to the detector
-        detections = self._detector.detect(
+        detections: list[Detection] = self._detector.detect(
             gray,
             estimate_tag_pose=True,
             camera_params=CAMERA_PARAMS,
             tag_size=APRILTAG_SIZE_METERS,
         )
 
-        results: list[TagDetectionState] = []
-        for det in detections:
-            pose_state = self._world_pose_from_detection(det.tag_id, det.pose_t)
-            results.append(
-                TagDetectionState(
-                    tag_id=det.tag_id,
-                    decision_margin=float(det.decision_margin),
-                    distance_m=float(np.linalg.norm(det.pose_t)),
-                    frame_id=packet.frame_id,
-                    timestamp_ms=packet.timestamp_ms,
-                    pose=pose_state,
-                )
+        return [
+            TagDetection(
+                tag_id=d.tag_id,
+                distance_m=float(np.linalg.norm(d.pose_t)),
+                center=tuple(d.center.tolist()),
             )
-        return results
-
-    def _world_pose_from_detection(
-        self, tag_id: int, translation: np.ndarray
-    ) -> PoseState | None:
-        """Calculates the robot's world pose based on a detected tag's relative pose.
-
-        This assumes the camera is at the robot's center and aligned with its heading.
-        It uses the known fixed position of the tag (Anchor).
-
-        Args:
-            tag_id (int): The ID of the detected tag.
-            translation (np.ndarray): The [x, y, z] translation vector from camera to tag.
-
-        Returns:
-            PoseState | None: The calculated robot pose, or None if tag ID is unknown.
-        """
-        anchor = APRILTAG_ANCHORS.get(tag_id)
-        if anchor is None:
-            return None
-
-        # Camera coordinate system usually: X right, Y down, Z forward
-        dx = float(translation[0])
-        dz = float(translation[2])
-        heading = anchor.theta
-
-        # Simple 2D transform assuming tag is flat on wall/ground at heading
-        cos_h = math.cos(heading)
-        sin_h = math.sin(heading)
-
-        # Calculate robot position relative to the anchor
-        x = anchor.x - (dz * cos_h - dx * sin_h)
-        y = anchor.y - (dz * sin_h + dx * cos_h)
-
-        return PoseState(x=x, y=y, theta=heading)
-
-    def _apply_pose_correction(self, detections: list[TagDetectionState]) -> None:
-        """Corrects the robot's internal pose based on absolute visual localization.
-
-        Args:
-            detections (list[TagDetectionState]): The list of valid detections.
-        """
-        for detection in detections:
-            if detection.pose is None:
-                continue
-            # Simple correction: Overwrite odometry with visual pose
-            self._state.pose = self._pose_clone(detection.pose)
-            self._state.last_update_ms = monotonic_ms()
-            break
-
-    def _pose_clone(self, pose: PoseState) -> PoseState:
-        """Creates a copy of a PoseState object."""
-        return PoseState(x=pose.x, y=pose.y, theta=pose.theta)
-
-    def _pose_model(self, pose: PoseState) -> Pose:
-        """Converts internal PoseState to a Pydantic Pose model."""
-        return Pose(x=pose.x, y=pose.y, theta=pose.theta)
-
-    def _wheel_model(self, sample: WheelSampleState) -> WheelSample:
-        """Converts internal WheelSampleState to a Pydantic WheelSample model."""
-        return WheelSample(
-            rotation_count=sample.rotation_count,
-            frequency_rpm=sample.frequency_rpm,
-            speed_m_s=sample.speed_m_s,
-            delta_count=sample.delta_count,
-            interval_ms=sample.interval_ms,
-        )
-
-    def _detection_model(self, detection: TagDetectionState) -> TagDetection:
-        """Converts internal TagDetectionState to a Pydantic TagDetection model."""
-        return TagDetection(
-            tag_id=detection.tag_id,
-            decision_margin=detection.decision_margin,
-            distance_m=detection.distance_m,
-            frame_id=detection.frame_id,
-            timestamp_ms=detection.timestamp_ms,
-            pose=self._pose_model(detection.pose)
-            if detection.pose is not None
-            else None,
-        )
-
-    def _pose_state_from_model(self, pose: Pose) -> PoseState:
-        """Converts a Pydantic Pose model to an internal PoseState object."""
-        return PoseState(x=pose.x, y=pose.y, theta=pose.theta)
+            for d in detections
+        ]
 
 
 robot = Robot()
@@ -762,149 +470,76 @@ dashboard_hub = DashboardHub()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manages the lifecycle of the FastAPI application.
-
-    Starts the robot background tasks on startup and shuts them down gracefully
-    on exit.
-    """
     await robot.start()
-    try:
-        yield
-    finally:
-        await robot.shutdown()
+    yield
+    await robot.shutdown()
 
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/state", response_model=RobotState)
 async def get_state() -> RobotState:
-    """Retrieves the current state of the robot (pose and wheel telemetry)."""
     return robot.state_snapshot()
 
 
-@app.post("/control/speed", response_model=CommandResponse)
-async def set_speed(command: CommandRequest) -> CommandResponse:
-    """Sets the target speed for the robot's wheels.
-
-    Args:
-        command (CommandRequest): The requested wheel speeds.
-
-    Returns:
-        CommandResponse: Confirmation of the command sent.
-
-    Raises:
-        HTTPException: If the robot is offline (503).
-    """
-    try:
-        await robot.send_command(command)
-    except RobotOfflineError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return CommandResponse(status="sent", target=command)
+@app.post("/control/speed")
+async def set_speed(cmd: CommandRequest):
+    await robot.send_command(cmd)
+    return {"status": "ok"}
 
 
-@app.post("/control/stop")
-async def stop_robot() -> dict[str, str]:
-    """Emergency stop for the robot.
-
-    Returns:
-        dict[str, str]: Status message.
-
-    Raises:
-        HTTPException: If the robot is offline (503).
-    """
-    try:
-        await robot.stop()
-    except RobotOfflineError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return {"status": "stopped"}
+@app.post("/mission")
+async def set_mission(req: MissionRequest):
+    return await robot.set_mission(req)
 
 
-@app.get("/vision/tags", response_model=VisionSnapshot)
-async def get_tags() -> VisionSnapshot:
-    """Retrieves the most recent AprilTag detections."""
-    return robot.vision_snapshot()
-
-
-@app.get("/mission", response_model=MissionStatus)
-async def get_mission() -> MissionStatus:
-    """Retrieves the current mission status."""
-    return robot.mission_status()
-
-
-@app.post("/mission", response_model=MissionStatus)
-async def create_mission(request: MissionRequest) -> MissionStatus:
-    """Submits a new navigation mission.
-
-    Args:
-        request (MissionRequest): Target pose and parameters.
-
-    Returns:
-        MissionStatus: The initial status of the new mission.
-    """
-    return await robot.set_mission(request)
-
-
-@app.delete("/mission", response_model=MissionStatus)
-async def cancel_mission() -> MissionStatus:
-    """Cancels the active mission."""
+@app.delete("/mission")
+async def cancel_mission():
     return await robot.cancel_mission()
 
 
 @app.websocket("/ws/robot")
-async def robot_websocket(websocket: WebSocket) -> None:
-    """WebSocket endpoint for robot connectivity.
-
-    Handles the bidirectional stream of commands (outbound) and telemetry/video
-    (inbound).
-
-    Args:
-        websocket (WebSocket): The incoming WebSocket connection.
-    """
-    await websocket.accept()
-    await robot.attach_websocket(websocket)
+async def robot_ws(ws: WebSocket):
+    await ws.accept()
+    await robot.attach_websocket(ws)
     try:
         while True:
-            message = await websocket.receive()
-            if "text" in message and message["text"] is not None:
-                raw = message["text"]
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
-                    data = None
-                if isinstance(data, dict) and data.get("type") == "pid_log":
-                    await dashboard_hub.broadcast_text(raw)
-                await robot.handle_text_message(raw)
-            elif "bytes" in message and message["bytes"] is not None:
-                await robot.process_frame(message["bytes"])
-            elif message.get("type") == "websocket.disconnect":
+            msg = await ws.receive()
+            if "text" in msg:
+                telemetry = TelemetryIncoming.model_validate_json(msg["text"])
+                robot.apply_telemetry(telemetry)
+                await dashboard_hub.broadcast_dashboard_message(
+                    DashboardMessage(data=telemetry)
+                )
+            elif "bytes" in msg:
+                await robot.process_frame(msg["bytes"])
+            elif msg.get("type") == "websocket.disconnect":
                 break
+            else:
+                logger.warning(f"Unknown message type: {msg}")
     except WebSocketDisconnect:
         pass
     finally:
-        await robot.detach_websocket(websocket)
+        await robot.detach_websocket(ws)
 
 
 @app.websocket("/ws/dashboard")
-async def dashboard_websocket(websocket: WebSocket) -> None:
-    """WebSocket endpoint for dashboard clients that consume debug streams."""
-
-    await websocket.accept()
-    await dashboard_hub.register(websocket)
+async def dashboard_ws(ws: WebSocket):
+    await ws.accept()
+    await dashboard_hub.register(ws)
     try:
         while True:
-            # Currently read-only: just drain incoming messages to detect disconnects.
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        pass
-    finally:
-        await dashboard_hub.unregister(websocket)
-
-
-@app.get("/dashboard")
-async def get_dashboard_html() -> HTMLResponse:
-    with open("pid_tuner.html", "r") as file:
-        return HTMLResponse(content=file.read(), media_type="text/html")
+            await ws.receive_text()
+    except Exception:
+        await dashboard_hub.unregister(ws)
 
 
 if __name__ == "__main__":

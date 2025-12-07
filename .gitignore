@@ -17,6 +17,7 @@ wheels/
 
 # Credentials
 src/credentials.h
+src/credentials.cpp
 
 # mosquitto
 password.file

@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <ArduinoWebsockets.h>
+#include <WebSocketsServer.h>
 #include <WiFi.h>
 #include <esp_camera.h>
 
@@ -12,11 +12,10 @@
 //
 
 // --- Networking ---
-const char *WS_HOST = "192.168.0.146";
-// const char *WS_HOST = "10.233.189.135";
 const uint16_t WS_PORT = 8000;
-const char *WS_PATH = "/ws/robot";
-const int64_t WS_RECONNECT_INTERVAL_MICROS = 5e6;
+
+const char *AP_SSID = "ESP32_Robot_AP";
+const char *AP_PASS = "robot1234";  // Must be at least 8 chars
 
 // --- Physics & Tuning ---
 // Left Wheel
@@ -45,29 +44,17 @@ const int64_t WS_RECONNECT_INTERVAL_MICROS = 5e6;
 #define SPEED_FILTER_ALPHA 0.1
 
 // --- Timing ---
-#define CONTROL_PERIOD_MICROS 200e3
+#define CONTROL_PERIOD_MICROS 100e3
 #define TELEMETRY_PERIOD_MICROS 50e3
-#define FRAME_STREAM_PERIOD_MICROS 50e3
+#define FRAME_STREAM_PERIOD_MICROS 200e3
 #define PWM_FREQ 5000
 #define PWM_RES 8
+#define HEARTBEAT_TIMEOUT_MICROS 500e3  // 500ms timeout
 
 //
 
 // DATA STRUCTURES
 //
-
-using namespace websockets;
-
-struct __attribute__((packed)) FramePacketHeader {
-  uint32_t magic = 0x46524D31;  // "FRM1"
-  uint16_t version = 1;
-  uint16_t reserved = 0;
-  uint32_t frameId;
-  uint32_t timestampMs;
-  uint16_t width;
-  uint16_t height;
-  uint32_t payloadLength;
-};
 
 struct PidConfig {
   double ks, kf, kp, ki;
@@ -237,9 +224,7 @@ class WheelController {
 // GLOBALS & INSTANCES
 //
 
-WebsocketsClient wsClient;
-bool cameraReady = false;
-uint32_t frameSequence = 0;
+WebSocketsServer webSocket = WebSocketsServer(WS_PORT);
 // Instantiate Left Wheel
 WheelController leftWheel(TUNING_L, PWM_CHAN_L, PIN_PWM_L, PIN_IN1_L, PIN_IN2_L,
                           PIN_ENC_L);
@@ -247,6 +232,9 @@ WheelController leftWheel(TUNING_L, PWM_CHAN_L, PIN_PWM_L, PIN_IN1_L, PIN_IN2_L,
 // Instantiate Right Wheel
 WheelController rightWheel(TUNING_R, PWM_CHAN_R, PIN_PWM_R, PIN_IN1_R,
                            PIN_IN2_R, PIN_ENC_R);
+
+// Failsafe: Track last heartbeat time
+int64_t lastHeartbeatTime = 0;
 
 // ISR Wrappers (Required because we can't attach class methods directly to
 // interrupts)
@@ -258,17 +246,27 @@ void IRAM_ATTR isrRight() { rightWheel.handleInterrupt(); }
 // NETWORK HELPERS
 //
 
-void connectWiFi() {
-  Serial.printf("Connecting to %s", ssid);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.printf("\nConnected: %s\n", WiFi.localIP().toString().c_str());
-}
+void setupAccessPoint() {
+  Serial.println("Setting up Access Point...");
 
+  // Set WiFi to Access Point Mode
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+
+  // Configure the AP
+  // (Optional: You can configure specific IP, Gateway, Subnet here if needed,
+  // but default 192.168.4.1 is fine)
+
+  bool result = WiFi.softAP(AP_SSID, AP_PASS);
+
+  if (result) {
+    Serial.println("AP Created Successfully");
+    Serial.print("AP IP Address: ");
+    Serial.println(WiFi.softAPIP());  // Should print 192.168.4.1
+  } else {
+    Serial.println("AP Creation Failed!");
+  }
+}
 void handleIncomingJson(String data) {
   JsonDocument doc;
   if (deserializeJson(doc, data)) {
@@ -276,25 +274,42 @@ void handleIncomingJson(String data) {
     return;
   }
 
-  if (doc["type"] == "command") {
+  const char *messageType = doc["message_type"] | "";
+
+  if (strcmp(messageType, "command") == 0) {
     leftWheel.targetSpeed = doc["left"] | 0.0;
     rightWheel.targetSpeed = doc["right"] | 0.0;
     Serial.printf("Target Left: %.3f\n", leftWheel.targetSpeed);
     Serial.printf("Target Right: %.3f\n", rightWheel.targetSpeed);
+  } else if (strcmp(messageType, "heartbeat") == 0) {
+    lastHeartbeatTime = esp_timer_get_time();
   }
 }
 
-void manageWebSocket() {
-  static int64_t lastAttempt = 0;
-  if (wsClient.available()) {
-    wsClient.poll();
-    return;
-  }
-
-  if (esp_timer_get_time() - lastAttempt > WS_RECONNECT_INTERVAL_MICROS) {
-    lastAttempt = esp_timer_get_time();
-    Serial.printf("WS Connect: %s:%d\n", WS_HOST, WS_PORT);
-    wsClient.connect(WS_HOST, WS_PORT, WS_PATH);
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload,
+                    size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[%u] Disconnected!\n", num);
+      break;
+    case WStype_CONNECTED: {
+      IPAddress ip = webSocket.remoteIP(num);
+      Serial.printf("[%u] Connected from %d.%d.%d.%d url: %s\n", num, ip[0],
+                    ip[1], ip[2], ip[3], payload);
+    } break;
+    case WStype_TEXT: {
+      String data = String((char *)payload);
+      handleIncomingJson(data);
+    } break;
+    case WStype_BIN:
+      Serial.printf("[%u] get binary length: %u\n", num, length);
+      break;
+    case WStype_ERROR:
+    case WStype_FRAGMENT_TEXT_START:
+    case WStype_FRAGMENT_BIN_START:
+    case WStype_FRAGMENT:
+    case WStype_FRAGMENT_FIN:
+      break;
   }
 }
 
@@ -304,7 +319,7 @@ void manageWebSocket() {
 //         //
 
 void sendTelemetry() {
-  if (!wsClient.available()) return;
+  if (webSocket.connectedClients() == 0) return;
 
   static int64_t lastTime = 0;
   int64_t now = esp_timer_get_time();
@@ -339,7 +354,7 @@ void sendTelemetry() {
 
   String payload;
   serializeJson(doc, payload);
-  wsClient.send(payload);
+  webSocket.broadcastTXT(payload);
 }
 
 void setupCamera() {
@@ -368,19 +383,14 @@ void setupCamera() {
   config.xclk_freq_hz = 20000000;  // 20MHz XCLK
 
   // config.pixel_format = PIXFORMAT_GRAYSCALE;
+  config.pixel_format = PIXFORMAT_JPEG;
 
-  // // 3. Frame Settings
-  // config.frame_size = FRAMESIZE_QVGA;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
 
-  // config.fb_count = 1;
-  // config.fb_location = CAMERA_FB_IN_PSRAM;
-  // config.grab_mode = CAMERA_GRAB_LATEST;
-
-  config.pixel_format = PIXFORMAT_JPEG;  // Was PIXFORMAT_GRAYSCALE
-  config.frame_size = FRAMESIZE_QVGA;    // 320x240
+  config.frame_size = FRAMESIZE_QVGA;  // 320x240
   config.jpeg_quality =
-      12;               // 0-63. 10-12 is good balance. Lower is higher quality.
-  config.fb_count = 2;  // Use 2 buffers for smoother streaming
+      10;  // 0-63. 10-12 is good balance. Lower is higher quality
+  config.fb_count = 2;
   config.grab_mode = CAMERA_GRAB_LATEST;
 
   // 4. Initialize
@@ -390,82 +400,30 @@ void setupCamera() {
     return;
   }
 
-  // 5. Optional: Flip frame if camera is mounted upside down
   sensor_t *s = esp_camera_sensor_get();
-  // s->set_vflip(s, 1);
-  // s->set_hmirror(s, 1);
 
-  cameraReady = true;  // <--- IMPORTANT: This allows loop() to stream
   Serial.println("Camera Configured Successfully");
 }
 
 void streamCamera(int64_t now) {
   static int64_t lastFrame = 0;
 
-  // 1. Throttle check
-  if (!cameraReady || !wsClient.available() ||
-      (now - lastFrame < FRAME_STREAM_PERIOD_MICROS))
-    return;
-
-  // --- START TIMING ---
-  int64_t t_start = esp_timer_get_time();
+  if (now - lastFrame < FRAME_STREAM_PERIOD_MICROS) return;
+  if (webSocket.connectedClients() == 0) return;
 
   camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) return;
+  if (!fb) {
+    Serial.println("Couldn't get fb");
+    return;
+  };
 
-  int64_t t_captured = esp_timer_get_time();  // Time after capture
-
-  // if (fb->format == PIXFORMAT_GRAYSCALE) {
-  if (fb->format == PIXFORMAT_JPEG) {
-    size_t hSize = sizeof(FramePacketHeader);
-    size_t totalSize = hSize + fb->len;
-
-    uint8_t *packet = (uint8_t *)malloc(totalSize);
-
-    if (packet) {
-      FramePacketHeader header;
-      header.magic = 0x46524D31;
-      header.frameId = frameSequence++;
-      header.timestampMs = now;
-      header.width = fb->width;
-      header.height = fb->height;
-      header.payloadLength = fb->len;
-
-      // Copy header
-      memcpy(packet, &header, hSize);
-      // Copy raw grayscale data
-      memcpy(packet + hSize, fb->buf, fb->len);
-
-      int64_t t_copied = esp_timer_get_time();  // Time after memory copy
-
-      // Send data
-      wsClient.sendBinary((const char *)packet, totalSize);
-
-      int64_t t_sent = esp_timer_get_time();  // Time after network send
-
-      free(packet);
-      lastFrame = now;
-
-      // --- PRINT DIAGNOSTICS ---
-      // Serial.printf(
-      //     "TIMING (ms) -> Capture: %lu | Copy: %lu | Network: %lu | Total: "
-      //     "%lu\n",
-      //     (t_captured - t_start),   // How long the camera took to give a
-      //     frame (t_copied - t_captured),  // How long malloc + memcpy took
-      //     (t_sent - t_copied),      // How long WiFi took to push data
-      //     (t_sent - t_start)        // Total time blocked
-      // );
-      Serial.printf(
-          "JPEG TIMING (us) -> Capture: %lu | Copy: %lu | Network: %lu | "
-          "Total: %lu | Size: %u bytes\n",
-          (t_captured - t_start), (t_copied - t_captured), (t_sent - t_copied),
-          (t_sent - t_start),
-          fb->len  // Look at how small this number is now!
-      );
-    } else {
-      Serial.println("Camera Malloc Failed");
-    }
-  }
+  int64_t sendStart = esp_timer_get_time();
+  webSocket.broadcastBIN(fb->buf, fb->len);
+  int64_t sendEnd = esp_timer_get_time();
+  int64_t sendDuration = sendEnd - sendStart;
+  Serial.printf("[Send] Frame size: %zu bytes, Time: %lld us (%.3f ms)\n",
+                fb->len, sendDuration, sendDuration / 1000.0);
+  lastFrame = now;
 
   esp_camera_fb_return(fb);
 }
@@ -478,6 +436,10 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  setupCamera();
+
+  setupAccessPoint();
+
   // Hardware Setup
   leftWheel.begin();
   attachInterrupt(digitalPinToInterrupt(leftWheel.pinEnc), isrLeft, CHANGE);
@@ -485,23 +447,35 @@ void setup() {
   rightWheel.begin();
   attachInterrupt(digitalPinToInterrupt(rightWheel.pinEnc), isrRight, CHANGE);
 
-  connectWiFi();
+  // WebSocket Server Setup
+  webSocket.onEvent(webSocketEvent);
+  webSocket.begin();
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("WebSocket server started on ws://");
+  Serial.print(IP);
+  Serial.print(":");
+  Serial.println(WS_PORT);
 
-  setupCamera();
-
-  // WebSocket Callbacks
-  wsClient.onMessage([](WebsocketsMessage msg) {
-    if (msg.isText()) handleIncomingJson(msg.data());
-  });
+  // Initialize failsafe timer
+  lastHeartbeatTime = 0;
 }
 
 void loop() {
   int64_t now = esp_timer_get_time();
 
-  // 1. Network
-  manageWebSocket();
+  // 1. Network - Process WebSocket events
+  webSocket.loop();
 
-  // 2. Control Loop
+  // 2. Failsafe: Stop if no heartbeat received
+  if (lastHeartbeatTime > 0 &&
+      (now - lastHeartbeatTime) > HEARTBEAT_TIMEOUT_MICROS) {
+    leftWheel.stop();
+    rightWheel.stop();
+    lastHeartbeatTime = 0;
+    Serial.println("Failsafe: No heartbeat received, stopping robot");
+  }
+
+  //   3. Control Loop
   static int64_t lastControl = 0;
   if (now - lastControl >= CONTROL_PERIOD_MICROS) {
     int64_t dt = now - lastControl;
@@ -510,7 +484,7 @@ void loop() {
     rightWheel.update(dt);
   }
 
-  // 3. Reporting
+  // 4. Reporting
   sendTelemetry();
   streamCamera(now);
 }

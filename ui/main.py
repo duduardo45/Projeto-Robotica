@@ -3,18 +3,21 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import struct
 import time
+from asyncio import TaskGroup
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import websockets
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from pupil_apriltags import Detection, Detector
 from pydantic import BaseModel, Field
+from turbojpeg import TJPF_GRAY, TurboJPEG
+from websockets.asyncio.client import ClientConnection
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -22,12 +25,18 @@ logger.addHandler(logging.StreamHandler())
 
 # --- Constants ---
 
+# define FX 509.932 // fx (in pixel)
+# define FY 509.932 // fy (in pixel)
+# define CX 390.456 // cx (in pixel)
+# define CY 176.282 // cy (in pixel)
+
 WHEEL_BASE_METERS = 0.28
-FRAME_PACKET_MAGIC = 0x46524D31
-FRAME_PACKET_VERSION = 1
-FRAME_HEADER_STRUCT = struct.Struct("<I H H I I H H I")
-APRILTAG_SIZE_METERS = 0.06
-CAMERA_PARAMS = (620.0, 620.0, 320.0, 240.0)
+APRILTAG_SIZE_METERS = 0.043
+CAMERA_PARAMS = (509.932, 509.932, 390.456, 176.282)
+CAMERA_WIDTH = 320
+CAMERA_HEIGHT = 240
+# Change this to "jpeg" or "grayscale" to switch frame format
+FRAME_FORMAT: Literal["jpeg", "grayscale"] = "jpeg"
 # valores errados:
 WHEEL_RADIUS_METERS = 0.04967
 TICKS_PER_METER = 64.0 * (1.0 / 2 * math.pi * WHEEL_RADIUS_METERS)
@@ -39,6 +48,11 @@ ANGULAR_SPEED_GAIN = 2.0
 HEADING_GAIN = 1.0
 
 MISSION_LOOP_INTERVAL_SECONDS = 0.2
+
+# Robot WebSocket Configuration
+ROBOT_WS_URL = "ws://192.168.4.1:8000"
+ROBOT_WS_RECONNECT_DELAY = 5.0
+HEARTBEAT_INTERVAL_SECONDS = 0.2  # Send heartbeat every 200ms
 
 # --- Helpers ---
 
@@ -53,8 +67,8 @@ def clamp(value: float, limit: float) -> float:
 
 
 def normalize_angle(angle: float) -> float:
-    """Keeps angle between -pi and pi."""
-    return (angle + math.pi) % (2 * math.pi) - math.pi
+    # Uses atan2 to wrap exactly to (-pi, pi]
+    return math.atan2(math.sin(angle), math.cos(angle))
 
 
 # --- Data Models (Simplified) ---
@@ -69,11 +83,10 @@ class Pose:
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class FramePacket:
-    frame_id: int
-    timestamp_micros: int
     width: int
     height: int
     data: bytes
+    format: Literal["jpeg", "grayscale"]
 
 
 class WheelTelemetry(BaseModel):
@@ -105,8 +118,12 @@ class TelemetryIncoming(BaseModel):
 
 class WheelsCommand(BaseModel):
     message_type: Literal["command"]
-    left_target_speed: float
-    right_target_speed: float
+    left: float
+    right: float
+
+
+class Heartbeat(BaseModel):
+    message_type: Literal["heartbeat"]
 
 
 class CommandRequest(BaseModel):
@@ -145,27 +162,6 @@ class RobotOfflineError(RuntimeError):
     pass
 
 
-def parse_frame_packet(payload: bytes) -> FramePacket | None:
-    if len(payload) <= FRAME_HEADER_STRUCT.size:
-        return None
-    (magic, version, _, frame_id, ts, w, h, p_len) = FRAME_HEADER_STRUCT.unpack_from(
-        payload, 0
-    )
-    if (
-        magic != FRAME_PACKET_MAGIC
-        or version != FRAME_PACKET_VERSION
-        or p_len != len(payload) - FRAME_HEADER_STRUCT.size
-    ):
-        return None
-    return FramePacket(
-        frame_id=frame_id,
-        timestamp_micros=ts,
-        width=w,
-        height=h,
-        data=payload[FRAME_HEADER_STRUCT.size :],
-    )
-
-
 # --- Internal State ---
 
 
@@ -178,7 +174,7 @@ class RobotStateData:
 
 
 @dataclass(kw_only=True, slots=True)
-class MissionPlan:
+class Mission:
     x: float
     y: float
     speed: float
@@ -201,14 +197,14 @@ class DashboardHub:
     async def broadcast_dashboard_message(self, message: DashboardMessage) -> None:
         for ws in list(self._connections):
             try:
-                await ws.send_json(message.model_dump(mode="json"))
+                await ws.send_text(message.model_dump_json())
             except Exception:
                 await self.unregister(ws)
 
-    async def broadcast_frame_packet(self, data: FramePacket) -> None:
+    async def broadcast_frame_packet(self, data: bytes) -> None:
         for ws in list(self._connections):
             try:
-                await ws.send_bytes(data.data)
+                await ws.send_bytes(data)
             except Exception:
                 await self.unregister(ws)
 
@@ -240,21 +236,64 @@ class Robot:
             ),
             last_update_micros=0,
         )
-        self._ws: WebSocket | None = None
-        self._mission: MissionPlan | None = None
-        self._mission_task: asyncio.Task[None] | None = None
+        self._ws_client: ClientConnection | None = None
+        self._mission: Mission | None = None
+        self._last_command_left: float = 0.0
+        self._last_command_right: float = 0.0
+
+        # We need a reference to the supervisor to cancel it on shutdown
+        self._supervisor_task: asyncio.Task[None] | None = None
+        self._running = False  # Flag to control the supervisor loop
 
         # Reduced detector settings for speed
         self._detector = Detector(families="tag36h11")
         self._latest_detections: list[TagDetection] = []
-        self._last_frame_timestamp_micros = 0
+        self._jpeg = TurboJPEG()
+
+    async def _run_lifecycle(self) -> None:
+        """
+        Uses TaskGroup to manage the three dependent loops.
+        If connection dies, everything cancels, and supervisor restarts them.
+        """
+        async with TaskGroup() as tg:
+            tg.create_task(self._robot_ws_client_loop())
+            tg.create_task(self._mission_control_loop())
+            tg.create_task(self._heartbeat_loop())
 
     async def start(self) -> None:
-        self._ensure_mission_task()
+        self._running = True
+        self._supervisor_task = asyncio.create_task(self._run_supervisor())
+
+    async def _run_supervisor(self) -> None:
+        """
+        The Resilient Supervisor:
+        If the logic crashes, we wait 1 second and restart the TaskGroup.
+        We do NOT kill the process.
+        """
+        logger.info("Robot Supervisor started.")
+        while self._running:
+            try:
+                # This blocks until one of the sub-tasks raises an exception
+                # or the connection closes unexpectedly.
+                await self._run_lifecycle()
+            except asyncio.CancelledError:
+                # App is shutting down
+                break
+            except Exception:
+                logger.exception("Robot subsystem crashed. Restarting in 1s...")
+                # Reset critical state if needed
+                self._ws_client = None
+                await asyncio.sleep(1.0)
 
     async def shutdown(self) -> None:
-        if self._mission_task:
-            self._mission_task.cancel()
+        self._running = False
+        if self._supervisor_task:
+            self._supervisor_task.cancel()
+            try:
+                await self._supervisor_task
+            except asyncio.CancelledError:
+                pass
+
         await self.stop()
 
     def state_snapshot(self) -> RobotState:
@@ -270,12 +309,9 @@ class Robot:
         return MissionStatus(state=state)
 
     async def set_mission(self, request: MissionRequest) -> MissionStatus:
-        self._mission = MissionPlan(
-            x=request.x,
-            y=request.y,
-            speed=request.speed,
-        )
-        self._ensure_mission_task()
+        if self._mission:
+            await self.cancel_mission()
+        self._mission = Mission(x=request.x, y=request.y, speed=request.speed)
         return self.mission_status()
 
     async def cancel_mission(self) -> MissionStatus:
@@ -283,33 +319,23 @@ class Robot:
         await self.stop()
         return self.mission_status()
 
-    async def attach_websocket(self, websocket: WebSocket) -> None:
-        self._ws = websocket
-
-    async def detach_websocket(self, websocket: WebSocket | None = None) -> None:
-        self._ws = None
+    async def _send_command_raw(self, left: float, right: float) -> None:
+        if self._ws_client:
+            msg = WheelsCommand(message_type="command", left=left, right=right)
+            await self._ws_client.send(msg.model_dump_json())
 
     async def send_command(self, request: CommandRequest) -> None:
-        if self._ws:
+        if self._ws_client:
             if self._mission:
                 await self.cancel_mission()
-            msg = WheelsCommand(
-                message_type="command",
-                left_target_speed=request.left,
-                right_target_speed=request.right,
-            )
-            await self._ws.send_json(msg.model_dump(mode="json"))
+            await self._send_command_raw(request.left, request.right)
 
     async def stop(self) -> None:
-        if self._ws:
+        if self._ws_client:
             if self._mission:
-                await self.cancel_mission()
-            msg = WheelsCommand(
-                message_type="command",
-                left_target_speed=0.0,
-                right_target_speed=0.0,
-            )
-            await self._ws.send_json(msg.model_dump(mode="json"))
+                # Don't call cancel_mission here to avoid circular logic in shutdown
+                self._mission = None
+            await self._send_command_raw(0.0, 0.0)
 
     # --- Simplified Odometry Here ---
     def apply_telemetry(self, msg: TelemetryIncoming) -> None:
@@ -353,97 +379,124 @@ class Robot:
         self._state.last_update_micros = msg.timestamp
 
     async def process_frame(self, payload: bytes) -> None:
-        packet = parse_frame_packet(payload)
-        if not packet:
-            return
-
-        await dashboard_hub.broadcast_frame_packet(packet)
+        await dashboard_hub.broadcast_frame_packet(payload)
 
         loop = asyncio.get_running_loop()
         # Don't block the event loop with vision processing
-        detections: list[TagDetection] = await loop.run_in_executor(
-            None, self._detect_tags, packet
-        )
-        if detections:
-            logger.debug(f"Detected {len(detections)} tags")
-
-        self._last_frame_timestamp_micros = packet.timestamp_micros
+        # For vision processing, we need grayscale, so convert JPEG if needed
+        tag_detections: list[TagDetection] = []
+        if FRAME_FORMAT == "jpeg":
+            tag_detections = await loop.run_in_executor(
+                None, self._detect_tags_from_jpeg, payload
+            )
+        else:
+            tag_detections = await loop.run_in_executor(
+                None, self._detect_tags_grayscale, payload
+            )
+        if tag_detections:
+            logger.debug(f"Detected {len(tag_detections)} tags")
 
         await dashboard_hub.broadcast_dashboard_message(
             DashboardMessage(
                 data=VisionSnapshot(
-                    message_type="vision_snapshot", detections=detections
+                    message_type="vision_snapshot", detections=tag_detections
                 ),
             )
         )
 
-    def _ensure_mission_task(self) -> None:
-        if self._mission_task is None or self._mission_task.done():
-            self._mission_task = asyncio.create_task(self._mission_loop())
+    async def _robot_ws_client_loop(self) -> None:
+        """Connects to the robot websocket server and handles incoming messages."""
+        while True:
+            logger.info(f"Connecting to robot at {ROBOT_WS_URL}...")
+            try:
+                async with websockets.connect(ROBOT_WS_URL) as ws:
+                    self._ws_client = ws
+                    logger.info("Connected to robot")
+                    try:
+                        async for message in ws:
+                            if isinstance(message, str):
+                                # JSON telemetry message
+                                try:
+                                    telemetry = TelemetryIncoming.model_validate_json(
+                                        message
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"Failed to parse telemetry: {e}")
+                                else:
+                                    self.apply_telemetry(telemetry)
+                                    await dashboard_hub.broadcast_dashboard_message(
+                                        DashboardMessage(data=telemetry)
+                                    )
+                            elif isinstance(message, bytes):
+                                # Binary frame data
+                                await self.process_frame(message)
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.info("Robot connection closed")
+                    finally:
+                        self._ws_client = None
+            except TimeoutError:
+                logger.error("Robot connection timed out")
+                self._ws_client = None
+                await asyncio.sleep(ROBOT_WS_RECONNECT_DELAY)
+
+    async def _heartbeat_loop(self) -> None:
+        """Sends periodic heartbeat messages to keep the robot alive."""
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            if self._ws_client:
+                msg = Heartbeat(message_type="heartbeat")
+                await self._ws_client.send(msg.model_dump_json())
 
     # --- Simplified Mission Logic Here ---
-    async def _mission_loop(self) -> None:
+    async def _mission_control_loop(self) -> None:
         while True:
             if not self._mission:
                 await asyncio.sleep(0.1)
                 continue
+            # We check self._mission again because of the await above
+            if self._mission:
+                pose = self._state.pose
+                dx = self._mission.x - pose.x
+                dy = self._mission.y - pose.y
+                dist = math.hypot(dx, dy)
 
-            # Simple Proportional Control Logic
-            pose = self._state.pose
-            dx = self._mission.x - pose.x
-            dy = self._mission.y - pose.y
-            dist = math.hypot(dx, dy)
+                if dist < ARRIVAL_TOLERANCE_METERS:
+                    await self.stop()
+                    self._mission = None
+                    logger.info("Mission Completed")
+                    continue
 
-            # 1. Check if we arrived
-            if dist < ARRIVAL_TOLERANCE_METERS:
-                await self.stop()
-                self._mission = None
-                logger.info("Mission Completed")
-                continue
+                target_angle = math.atan2(dy, dx)
+                angle_error = normalize_angle(target_angle - pose.theta)
 
-            # 2. Calculate Heading Error
-            target_angle = math.atan2(dy, dx)
-            angle_error = normalize_angle(target_angle - pose.theta)
-
-            # 3. Determine Wheel Speeds
-            # Strategy: Rotate until aligned, then move forward
-            lin_cmd = 0.0
-            ang_cmd = 0.0
-
-            if abs(angle_error) > HEADING_TOLERANCE_RADIANS:
-                # Rotate in place
-                ang_cmd = ANGULAR_SPEED_GAIN * angle_error
                 lin_cmd = 0.0
-            else:
-                # Move forward towards target
-                lin_cmd = self._mission.speed
-                # Maintain heading
-                ang_cmd = HEADING_GAIN * angle_error
+                ang_cmd = 0.0
 
-            # 4. Clamp output
-            lin_cmd = clamp(lin_cmd, self._mission.speed)
-            ang_cmd = clamp(ang_cmd, ANGULAR_SPEED_LIMIT_RADIANS)
+                if abs(angle_error) > HEADING_TOLERANCE_RADIANS:
+                    ang_cmd = ANGULAR_SPEED_GAIN * angle_error
+                    lin_cmd = 0.0
+                else:
+                    lin_cmd = self._mission.speed
+                    ang_cmd = HEADING_GAIN * angle_error
 
-            # 5. Convert Unicycle (v, w) to Differential (vl, vr)
-            # left = v - (w * base / 2)
-            # right = v + (w * base / 2)
-            half_base = WHEEL_BASE_METERS / 2.0
-            left_speed = lin_cmd - (ang_cmd * half_base)
-            right_speed = lin_cmd + (ang_cmd * half_base)
+                lin_cmd = clamp(lin_cmd, self._mission.speed)
+                ang_cmd = clamp(ang_cmd, ANGULAR_SPEED_LIMIT_RADIANS)
 
-            try:
-                await self.send_command(
-                    CommandRequest(left=left_speed, right=right_speed)
-                )
-            except RobotOfflineError:
-                self._mission = None  # Abort
+                half_base = WHEEL_BASE_METERS / 2.0
+                left_speed = lin_cmd - (ang_cmd * half_base)
+                right_speed = lin_cmd + (ang_cmd * half_base)
+
+                try:
+                    await self._send_command_raw(left_speed, right_speed)
+                except RobotOfflineError:
+                    self._mission = None
 
             await asyncio.sleep(MISSION_LOOP_INTERVAL_SECONDS)
 
-    def _detect_tags(self, packet: FramePacket) -> list[TagDetection]:
-        np_buffer = np.frombuffer(packet.data, dtype=np.uint8)
+    def _detect_tags_grayscale(self, packet: bytes) -> list[TagDetection]:
+        np_buffer = np.frombuffer(packet, dtype=np.uint8)
         try:
-            gray = np_buffer.reshape((packet.height, packet.width))
+            gray = np_buffer.reshape((CAMERA_HEIGHT, CAMERA_WIDTH))
         except ValueError:
             return []
 
@@ -454,6 +507,30 @@ class Robot:
             tag_size=APRILTAG_SIZE_METERS,
         )
 
+        return [
+            TagDetection(
+                tag_id=d.tag_id,
+                distance_m=float(np.linalg.norm(d.pose_t)),
+                center=tuple(d.center.tolist()),
+            )
+            for d in detections
+        ]
+
+    def _detect_tags_from_jpeg(self, packet: bytes) -> list[TagDetection]:
+        """Convert JPEG to grayscale for tag detection."""
+        img = self._jpeg.decode(packet, pixel_format=TJPF_GRAY)
+
+        if len(img.shape) == 3:
+            img = img[:, :, 0]
+
+        if img.dtype != np.uint8:
+            img = img.astype(np.uint8)
+        detections: list[Detection] = self._detector.detect(
+            img,
+            estimate_tag_pose=True,
+            camera_params=CAMERA_PARAMS,
+            tag_size=APRILTAG_SIZE_METERS,
+        )
         return [
             TagDetection(
                 tag_id=d.tag_id,
@@ -506,31 +583,6 @@ async def cancel_mission():
     return await robot.cancel_mission()
 
 
-@app.websocket("/ws/robot")
-async def robot_ws(ws: WebSocket):
-    await ws.accept()
-    await robot.attach_websocket(ws)
-    try:
-        while True:
-            msg = await ws.receive()
-            if "text" in msg:
-                telemetry = TelemetryIncoming.model_validate_json(msg["text"])
-                robot.apply_telemetry(telemetry)
-                await dashboard_hub.broadcast_dashboard_message(
-                    DashboardMessage(data=telemetry)
-                )
-            elif "bytes" in msg:
-                await robot.process_frame(msg["bytes"])
-            elif msg.get("type") == "websocket.disconnect":
-                break
-            else:
-                logger.warning(f"Unknown message type: {msg}")
-    except WebSocketDisconnect:
-        pass
-    finally:
-        await robot.detach_websocket(ws)
-
-
 @app.websocket("/ws/dashboard")
 async def dashboard_ws(ws: WebSocket):
     await ws.accept()
@@ -538,7 +590,8 @@ async def dashboard_ws(ws: WebSocket):
     try:
         while True:
             await ws.receive_text()
-    except Exception:
+    except Exception as e:
+        logger.warning(e)
         await dashboard_hub.unregister(ws)
 
 

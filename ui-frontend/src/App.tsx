@@ -94,6 +94,10 @@ interface DashboardMessage {
 const WS_URL = "ws://localhost:8000/ws/dashboard";
 const API_URL = "http://localhost:8000";
 const MAX_POINTS = 600;
+// Change these to switch frame format and resolution
+const FRAME_FORMAT: "jpeg" | "grayscale" = "jpeg";
+const FRAME_WIDTH = 320;
+const FRAME_HEIGHT = 240;
 
 // --- Metric Input helper (simplified styling) ---
 interface MetricInputProps {
@@ -246,11 +250,16 @@ export default function RobotDashboard() {
 		ws.onmessage = (event) => {
 			// 1. Binary Frame Handling
 			if (event.data instanceof ArrayBuffer) {
-				cameraRef.current?.handleFrame(event.data);
+				cameraRef.current?.handleFrame(
+					event.data,
+					FRAME_WIDTH,
+					FRAME_HEIGHT,
+					FRAME_FORMAT,
+				);
 				return;
 			}
 
-			// 2. JSON Telemetry Handling
+			// 2. JSON Message Handling
 			const msg = JSON.parse(event.data) as DashboardMessage;
 
 			// Dispatch based on 'message_type'

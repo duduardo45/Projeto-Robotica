@@ -17,7 +17,7 @@ const uint16_t WS_PORT = 8000;
 const char *AP_SSID = "ESP32_Robot_AP";
 const char *AP_PASS = "robot1234";  // Must be at least 8 chars
 
-// #define WHEELS_ENABLED
+// #define WHEELS_DISABLED
 // --- Physics & Tuning ---
 // Left Wheel
 #define PIN_ENC_L 21
@@ -115,10 +115,10 @@ class WheelController {
 
   // Call from ISR
   void IRAM_ATTR handleInterrupt() {
-#ifdef WHEELS_ENABLED
-    encoderCount++;
-#else
+#ifdef WHEELS_DISABLED
     encoderCount = 0;
+#else
+    encoderCount++;
 #endif
   }
 

@@ -1,12 +1,7 @@
 import { Box, Flex, Text } from "@chakra-ui/react";
 import { Camera } from "lucide-react";
 import { forwardRef, useImperativeHandle, useRef } from "react";
-
-interface TagDetection {
-	tag_id: number;
-	distance_m: number;
-	center: [number, number];
-}
+import type { TagDetection } from "../types";
 
 export interface CameraFeedRef {
 	handleFrame: (
@@ -93,6 +88,8 @@ export const CameraFeed = forwardRef<CameraFeedRef, object>((_, ref) => {
 				const [cX, cY] = det.center;
 				const id = det.tag_id;
 				const dist = det.distance_m;
+				const yaw = det.yaw_rel;
+				const angleOffset = det.angle_offset;
 
 				ctx.beginPath();
 				ctx.arc(cX, cY, 4, 0, 2 * Math.PI);
@@ -101,6 +98,12 @@ export const CameraFeed = forwardRef<CameraFeedRef, object>((_, ref) => {
 				ctx.fillText(`ID: ${id}`, cX + 10, cY - 10);
 				if (dist !== undefined) {
 					ctx.fillText(`${dist.toFixed(2)}m`, cX + 10, cY + 10);
+				}
+				if (yaw !== undefined) {
+					ctx.fillText(`Yaw: ${yaw.toFixed(2)}°`, cX + 10, cY + 30);
+				}
+				if (angleOffset !== undefined) {
+					ctx.fillText(`Offset: ${angleOffset.toFixed(2)}°`, cX + 10, cY + 50);
 				}
 			});
 		}

@@ -26,6 +26,7 @@ import {
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { CameraFeed, type CameraFeedRef } from "./components/CameraFeed";
 import { system } from "./theme";
+import type { TagDetection } from "./types";
 
 // --- TYPES ---
 interface ChartPoint {
@@ -68,26 +69,27 @@ interface WheelTelemetry {
 	debug_out: number;
 }
 
-interface TelemetryData {
-	message_type: "telemetry";
-	timestamp: number;
-	left: WheelTelemetry;
-	right: WheelTelemetry;
-}
-
-interface TagDetection {
-	tag_id: number;
-	distance_m: number;
-	center: [number, number];
-}
-
 interface VisionSnapshotData {
 	message_type: "vision_snapshot";
 	detections: TagDetection[];
 }
 
+interface Pose {
+	x: number;
+	y: number;
+	theta: number;
+}
+
+interface RobotStateData {
+	message_type: "robot_state";
+	pose: Pose;
+	left: WheelTelemetry;
+	right: WheelTelemetry;
+	last_update_micros: number;
+}
+
 interface DashboardMessage {
-	data: TelemetryData | VisionSnapshotData;
+	data: VisionSnapshotData | RobotStateData;
 }
 
 // --- CONFIGURATION ---
@@ -238,6 +240,7 @@ export default function RobotDashboard() {
 		speed: 0.3,
 	});
 	const [, setMissionStatus] = useState<MissionStatus | null>(null);
+	const [robotState, setRobotState] = useState<RobotStateData | null>(null);
 	const chartDataRef = useRef<ChartPoint[]>([]);
 	const cameraRef = useRef<CameraFeedRef>(null);
 
@@ -266,28 +269,32 @@ export default function RobotDashboard() {
 			if (msg.data.message_type === "vision_snapshot") {
 				const visionData = msg.data as VisionSnapshotData;
 				cameraRef.current?.handleDetections(visionData);
-			} else if (msg.data.message_type === "telemetry") {
-				const telMsg = msg.data as TelemetryData;
+			} else if (msg.data.message_type === "robot_state") {
+				const robotStateData = msg.data as RobotStateData;
+				setRobotState(robotStateData);
 
-				if (startTime === null) startTime = telMsg.timestamp;
+				if (startTime === null) startTime = robotStateData.last_update_micros;
 
-				// Map Telemetry keys to Chart keys
+				// Map Robot State keys to Chart keys
 				chartDataRef.current.push({
-					t: (telMsg.timestamp - (startTime ?? telMsg.timestamp)) / 1_000_000.0, // convert micros to sec
+					t:
+						(robotStateData.last_update_micros -
+							(startTime ?? robotStateData.last_update_micros)) /
+						1_000_000.0, // convert micros to sec
 
 					// Left
-					left_target: telMsg.left.target_speed,
-					left_measured: telMsg.left.filtered_speed,
-					left_pwm: telMsg.left.debug_out,
-					left_p: telMsg.left.debug_p,
-					left_i: telMsg.left.debug_i,
+					left_target: robotStateData.left.target_speed,
+					left_measured: robotStateData.left.filtered_speed,
+					left_pwm: robotStateData.left.debug_out,
+					left_p: robotStateData.left.debug_p,
+					left_i: robotStateData.left.debug_i,
 
 					// Right
-					right_target: telMsg.right.target_speed,
-					right_measured: telMsg.right.filtered_speed,
-					right_pwm: telMsg.right.debug_out,
-					right_p: telMsg.right.debug_p,
-					right_i: telMsg.right.debug_i,
+					right_target: robotStateData.right.target_speed,
+					right_measured: robotStateData.right.filtered_speed,
+					right_pwm: robotStateData.right.debug_out,
+					right_p: robotStateData.right.debug_p,
+					right_i: robotStateData.right.debug_i,
 				});
 
 				if (chartDataRef.current.length > MAX_POINTS)
@@ -365,6 +372,69 @@ export default function RobotDashboard() {
 					{/* LEFT: CHARTS */}
 					<Stack gap={6}>
 						<CameraFeed ref={cameraRef} />
+
+						{/* ROBOT STATE PANEL */}
+						<Box layerStyle="panel">
+							<Flex justify="space-between" align="center" mb={4}>
+								<Text textStyle="label" fontSize="sm" fontWeight="bold">
+									Robot State
+								</Text>
+								{robotState && (
+									<Text textStyle="monoVal" fontSize="xs" color="fg.muted">
+										Last update:{" "}
+										{(robotState.last_update_micros / 1_000_000).toFixed(3)}s
+									</Text>
+								)}
+							</Flex>
+							{robotState ? (
+								<Grid templateColumns="repeat(3, 1fr)" gap={4}>
+									<Box>
+										<Text
+											textStyle="label"
+											fontSize="xs"
+											color="fg.muted"
+											mb={1}
+										>
+											Position X
+										</Text>
+										<Text textStyle="monoVal" fontSize="lg">
+											{robotState.pose.x.toFixed(3)} m
+										</Text>
+									</Box>
+									<Box>
+										<Text
+											textStyle="label"
+											fontSize="xs"
+											color="fg.muted"
+											mb={1}
+										>
+											Position Y
+										</Text>
+										<Text textStyle="monoVal" fontSize="lg">
+											{robotState.pose.y.toFixed(3)} m
+										</Text>
+									</Box>
+									<Box>
+										<Text
+											textStyle="label"
+											fontSize="xs"
+											color="fg.muted"
+											mb={1}
+										>
+											Heading (θ)
+										</Text>
+										<Text textStyle="monoVal" fontSize="lg">
+											{((robotState.pose.theta * 180) / Math.PI).toFixed(1)}°
+										</Text>
+									</Box>
+								</Grid>
+							) : (
+								<Text textStyle="monoVal" fontSize="sm" color="fg.muted">
+									Waiting for robot state...
+								</Text>
+							)}
+						</Box>
+
 						<Grid templateColumns="1fr 1fr" gap={6}>
 							<LiveChart
 								title="Left Velocity"

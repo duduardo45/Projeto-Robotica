@@ -28,24 +28,29 @@ logger.addHandler(logging.StreamHandler())
 
 # --- Constants ---
 
-# define FX 509.932 // fx (in pixel)
-# define FY 509.932 // fy (in pixel)
-# define CX 390.456 // cx (in pixel)
-# define CY 176.282 // cy (in pixel)
-
 WHEEL_BASE_METERS = 0.17  # distance between the two wheels
 WHEEL_RADIUS_METERS = 0.025
 TICKS_PER_ROTATION = 64.0
-TICKS_PER_METER = TICKS_PER_ROTATION * (1.0 / 2 * math.pi * WHEEL_RADIUS_METERS)
-APRILTAG_SIZE_METERS = 0.043
+# Circumference = 2 * pi * r
+# Ticks per Meter = Ticks per Rotation / Circumference
+TICKS_PER_METER = TICKS_PER_ROTATION / (2.0 * math.pi * WHEEL_RADIUS_METERS)
+APRILTAG_SIZE_METERS = 0.12
 
-CAMERA_PARAMS = (509.932, 509.932, 390.456, 176.282)
+# --------- RESULTS from the actual robot ---------
+# FX = 298.268
+# FY = 306.894
+# CX = 158.837
+# CY = 121.671
+# -----------------------------------------
+
+CAMERA_PARAMS = (298.268, 306.894, 158.837, 121.671)
 CAMERA_WIDTH = 320
 CAMERA_HEIGHT = 240
+CAMERA_INVERT_X = True
 FRAME_FORMAT: Literal["jpeg", "grayscale"] = "jpeg"
 
 ARRIVAL_TOLERANCE_METERS = 0.05
-HEADING_TOLERANCE_RADIANS = 0.1
+HEADING_TOLERANCE_RADIANS = 0.5
 ANGULAR_SPEED_LIMIT_RADIANS = 2.0
 ANGULAR_SPEED_GAIN = 2.0
 HEADING_GAIN = 1.0
@@ -64,7 +69,7 @@ TAG_MAP = {
 
 
 def monotonic_micros() -> int:
-    return time.time_ns() // 1_000
+    return time.monotonic_ns() // 1_000
 
 
 def clamp(value: float, limit: float) -> float:
@@ -327,8 +332,10 @@ class Robot:
                 await self._supervisor_task
             except asyncio.CancelledError:
                 pass
-
-        await self.stop()
+        try:
+            await self.stop()
+        except RobotWebSocketNotConnected:
+            logger.info("Could not stop robot at shutdown, not connected")
 
     def mission_status(self) -> MissionStatus:
         state = "running" if self._mission else "idle"
@@ -576,6 +583,8 @@ class Robot:
             # z = forward distance, x = horizontal offset
             t_vec = d.pose_t.flatten()  # type: ignore
             x = t_vec[0]  # type: ignore
+            if CAMERA_INVERT_X:
+                x = -x  # pyright: ignore [reportUnknownVariableType]
             z = t_vec[2]  # type: ignore
 
             dist = float(np.linalg.norm(t_vec))  # type: ignore

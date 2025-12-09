@@ -25,7 +25,7 @@ const char *AP_PASS = "robot1234";  // Must be at least 8 chars
 #define PIN_IN1_L 44
 #define PIN_IN2_L 2
 #define PWM_CHAN_L 2  // Channel 0 is taken by Camera! Using 2.
-#define TUNING_L {70.0, 10.0, 40.0, 30.0}  // {ks, kf, kp, ki}
+#define TUNING_L {90.0, 10.0, 40.0, 30.0}  // {ks, kf, kp, ki}
 
 // Right Wheel. it has a bigger ks because it has more static friction
 #define PIN_ENC_R 47
@@ -42,10 +42,13 @@ const char *AP_PASS = "robot1234";  // Must be at least 8 chars
 #define INTEGRATOR_CLAMP 6.0
 // SPEED_FILTER_ALPHA the lower you make it, the slower is the exponential
 // average:
-#define SPEED_FILTER_ALPHA 0.1
+#define SPEED_FILTER_ALPHA 0.15
+
+#define MAX_ACCEL 0.3
+#define DITHER_MAGNITUDE 60.0
 
 // --- Timing ---
-#define CONTROL_PERIOD_MICROS 100e3
+#define CONTROL_PERIOD_MICROS 25e3
 #define TELEMETRY_PERIOD_MICROS 50e3
 #define FRAME_STREAM_PERIOD_MICROS 200e3
 #define PWM_FREQ 5000
@@ -57,9 +60,31 @@ const char *AP_PASS = "robot1234";  // Must be at least 8 chars
 // DATA STRUCTURES
 //
 
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+// Mutex for protecting variables shared between loop() and motorTask()
+portMUX_TYPE sharedVarMux = portMUX_INITIALIZER_UNLOCKED;
+
 struct PidConfig {
   double ks, kf, kp, ki;
 };
+
+// --- THREAD SAFETY BRIDGE ---
+struct MotorCommand {
+  double targetL;
+  double targetR;
+  int64_t lastHeartbeat;
+};
+
+struct MotorState {
+  double encL, rawL, filtL, targetL;
+  double encR, rawR, filtR, targetR;
+  double debug_fL, debug_pL, debug_iL, debug_outL;
+  double debug_fR, debug_pR, debug_iR, debug_outR;
+};
+
+// Global instances of the bridge data
+MotorCommand sharedCommand = {0, 0, 0};
+MotorState sharedState = {0};
 
 //
 
@@ -77,11 +102,13 @@ class WheelController {
   volatile unsigned long encoderCount = 0;
   unsigned long lastEncoderCount = 0;
 
-  double targetSpeed = 0.0;    // m/s
-  double filteredSpeed = 0.0;  // m/s (filtered)
-  double rawSpeed = 0.0;       // m/s (instant)
+  double targetSpeed = 0.0;     // m/s
+  double internalTarget = 0.0;  // m/s (ramped target)
+  double filteredSpeed = 0.0;   // m/s (filtered)
+  double rawSpeed = 0.0;        // m/s (instant)
   double filteredRpm = 0.0;
   double integrator = 0.0;
+  bool ditherState = false;
 
   double debug_p = 0;
   double debug_i = 0;
@@ -127,10 +154,11 @@ class WheelController {
     digitalWrite(pinIn2, LOW);
     ledcWrite(pwmChannel, 0);
     targetSpeed = 0;
+    internalTarget = 0;
     integrator = 0;
   }
 
-  void update(int64_t nowMicros) {
+  void update() {
     // 1. Atomic Encoder Read
     unsigned long currentCount;
     noInterrupts();
@@ -161,7 +189,7 @@ class WheelController {
       // We did NOT move this loop.
       // Check how long it has been since the last move.
       // If > 100ms (0.1s), force speed to 0.
-      if ((currentMicros - lastPulseMicros) > 100000) {
+      if ((currentMicros - lastPulseMicros) > 200e3) {
         instantSpeed = 0.0;
         filteredSpeed = 0.0;  // Force filter reset
       } else {
@@ -180,12 +208,24 @@ class WheelController {
 
     filteredRpm = (filteredSpeed / _metersPerPulse) * 60.0 / PULSES_PER_ROT;
 
-    // 5. Control Logic
+    // 5. Ramping (The Wedge)
+    // Move the internal target towards the real target slowly
+    double max_step = MAX_ACCEL * dtSec;
+
+    if (targetSpeed > internalTarget) {
+      internalTarget += max_step;
+      if (internalTarget > targetSpeed) internalTarget = targetSpeed;
+    } else if (targetSpeed < internalTarget) {
+      internalTarget -= max_step;
+      if (internalTarget < targetSpeed) internalTarget = targetSpeed;
+    }
+
+    // 6. Control Logic
     bool forward = (targetSpeed >= 0);
     digitalWrite(pinIn1, forward ? HIGH : LOW);
     digitalWrite(pinIn2, forward ? LOW : HIGH);
 
-    double targetAbs = fabs(targetSpeed);
+    double targetAbs = fabs(internalTarget);
     double error = targetAbs - filteredSpeed;
 
     // Integral Anti-windup
@@ -196,25 +236,34 @@ class WheelController {
       integrator = constrain(integrator, -INTEGRATOR_CLAMP, INTEGRATOR_CLAMP);
     }
 
-    // 6. Calculate Output
+    // 7. Calculate Output
 
-    double output = 0.0;
+    double pid_out = 0.0;
     if (targetAbs > 0.01) {
       // Break it down for logging
       debug_f = _pid.kf * targetAbs;
       debug_p = _pid.kp * error;
       debug_i = _pid.ki * integrator;
 
-      output = _pid.ks + debug_f + debug_p + debug_i;
+      pid_out = _pid.ks + debug_f + debug_p + debug_i;
     } else {
       debug_f = 0;
       debug_p = 0;
       debug_i = 0;
     }
 
-    debug_out = output;  // Store unconstrained output
+    // 8. Dithering (The Lubricant)
+    // Flip sign every loop (20ms).
+    // This creates a 25Hz vibration.
+    int dither = (ditherState) ? DITHER_MAGNITUDE : -DITHER_MAGNITUDE;
+    ditherState = !ditherState;  // Toggle for next time
+    // Only dither if we are trying to move
+    if (fabs(internalTarget) < 0.001) dither = 0;
+    double finalOutput = pid_out + dither;
 
-    int pwm = (int)constrain(round(output), 0.0, 255.0);
+    debug_out = finalOutput;  // Store unconstrained output
+
+    int pwm = (int)constrain(round(finalOutput), 0.0, 255.0);
 
     ledcWrite(pwmChannel, pwm);
   }
@@ -239,9 +288,6 @@ WheelController leftWheel(TUNING_L, PWM_CHAN_L, PIN_PWM_L, PIN_IN1_L, PIN_IN2_L,
 // Instantiate Right Wheel
 WheelController rightWheel(TUNING_R, PWM_CHAN_R, PIN_PWM_R, PIN_IN1_R,
                            PIN_IN2_R, PIN_ENC_R);
-
-// Failsafe: Track last heartbeat time
-int64_t lastHeartbeatTime = 0;
 
 // ISR Wrappers (Required because we can't attach class methods directly to
 // interrupts)
@@ -274,6 +320,7 @@ void setupAccessPoint() {
     Serial.println("AP Creation Failed!");
   }
 }
+
 void handleIncomingJson(String data) {
   JsonDocument doc;
   if (deserializeJson(doc, data)) {
@@ -284,12 +331,21 @@ void handleIncomingJson(String data) {
   const char *messageType = doc["message_type"] | "";
 
   if (strcmp(messageType, "command") == 0) {
-    leftWheel.targetSpeed = doc["left"] | 0.0;
-    rightWheel.targetSpeed = doc["right"] | 0.0;
+    double newLeft = doc["left"] | 0.0;
+    double newRight = doc["right"] | 0.0;
+
+    portENTER_CRITICAL(&sharedVarMux);
+    sharedCommand.targetL = newLeft;
+    sharedCommand.targetR = newRight;
+    portEXIT_CRITICAL(&sharedVarMux);
+
     Serial.printf("Target Left: %.3f\n", leftWheel.targetSpeed);
     Serial.printf("Target Right: %.3f\n", rightWheel.targetSpeed);
+
   } else if (strcmp(messageType, "heartbeat") == 0) {
-    lastHeartbeatTime = esp_timer_get_time();
+    portENTER_CRITICAL(&sharedVarMux);
+    sharedCommand.lastHeartbeat = esp_timer_get_time();
+    portEXIT_CRITICAL(&sharedVarMux);
   }
 }
 
@@ -333,31 +389,34 @@ void sendTelemetry() {
   if (now - lastTime < TELEMETRY_PERIOD_MICROS) return;
   lastTime = now;
 
+  MotorState stateSnapshot;
+  portENTER_CRITICAL(&sharedVarMux);
+  stateSnapshot = sharedState;
+  portEXIT_CRITICAL(&sharedVarMux);
+
   JsonDocument doc;
   doc["message_type"] = "telemetry";
   doc["timestamp"] = now;
 
   JsonObject left = doc["left"].to<JsonObject>();
-  left["encoder"] = leftWheel.encoderCount;
-  left["raw_speed"] = leftWheel.rawSpeed;
-  left["filtered_speed"] = leftWheel.filteredSpeed;
-  left["target_speed"] = leftWheel.targetSpeed;
-
-  left["debug_f"] = leftWheel.debug_f;
-  left["debug_p"] = leftWheel.debug_p;
-  left["debug_i"] = leftWheel.debug_i;
-  left["debug_out"] = leftWheel.debug_out;
+  left["encoder"] = stateSnapshot.encL;
+  left["raw_speed"] = stateSnapshot.rawL;
+  left["filtered_speed"] = stateSnapshot.filtL;
+  left["target_speed"] = stateSnapshot.targetL;
+  left["debug_f"] = stateSnapshot.debug_fL;
+  left["debug_p"] = stateSnapshot.debug_pL;
+  left["debug_i"] = stateSnapshot.debug_iL;
+  left["debug_out"] = stateSnapshot.debug_outL;
 
   JsonObject right = doc["right"].to<JsonObject>();
-  right["encoder"] = rightWheel.encoderCount;
-  right["raw_speed"] = rightWheel.rawSpeed;
-  right["filtered_speed"] = rightWheel.filteredSpeed;
-  right["target_speed"] = rightWheel.targetSpeed;
-
-  right["debug_f"] = rightWheel.debug_f;
-  right["debug_p"] = rightWheel.debug_p;
-  right["debug_i"] = rightWheel.debug_i;
-  right["debug_out"] = rightWheel.debug_out;
+  right["encoder"] = stateSnapshot.encR;
+  right["raw_speed"] = stateSnapshot.rawR;
+  right["filtered_speed"] = stateSnapshot.filtR;
+  right["target_speed"] = stateSnapshot.targetR;
+  right["debug_f"] = stateSnapshot.debug_fR;
+  right["debug_p"] = stateSnapshot.debug_pR;
+  right["debug_i"] = stateSnapshot.debug_iR;
+  right["debug_out"] = stateSnapshot.debug_outR;
 
   String payload;
   serializeJson(doc, payload);
@@ -435,6 +494,65 @@ void streamCamera(int64_t now) {
   esp_camera_fb_return(fb);
 }
 
+// Task Handle to manage the task if needed
+TaskHandle_t motorTaskHandle = NULL;
+
+void motorTask(void *parameter) {
+  const TickType_t xFrequency = pdMS_TO_TICKS(20);
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  for (;;) {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+    // --- PHASE 1: IMPORT DATA (CRITICAL SECTION) ---
+    double tL, tR;
+    int64_t hb;
+
+    portENTER_CRITICAL(&sharedVarMux);
+    tL = sharedCommand.targetL;
+    tR = sharedCommand.targetR;
+    hb = sharedCommand.lastHeartbeat;
+    portEXIT_CRITICAL(&sharedVarMux);
+
+    // --- PHASE 2: LOGIC & PHYSICS (NO LOCKS REQUIRED) ---
+    // The wheels are "private" to this task now. safely write to them.
+
+    // Failsafe Logic
+    int64_t now = esp_timer_get_time();
+    if (hb > 0 && (now - hb) > HEARTBEAT_TIMEOUT_MICROS) {
+      leftWheel.stop();
+      rightWheel.stop();
+      // Optional: Update shared heartbeat to 0 to signal stop?
+      // Usually not strictly necessary if client sends new hb later.
+    } else {
+      leftWheel.targetSpeed = tL;
+      rightWheel.targetSpeed = tR;
+
+      leftWheel.update();
+      rightWheel.update();
+    }
+
+    // --- PHASE 3: EXPORT DATA (CRITICAL SECTION) ---
+    portENTER_CRITICAL(&sharedVarMux);
+    sharedState.encL = leftWheel.encoderCount;
+    sharedState.filtL = leftWheel.filteredSpeed;
+    sharedState.targetL = leftWheel.targetSpeed;
+    sharedState.debug_fL = leftWheel.debug_f;
+    sharedState.debug_pL = leftWheel.debug_p;
+    sharedState.debug_iL = leftWheel.debug_i;
+    sharedState.debug_outL = leftWheel.debug_out;
+
+    sharedState.encR = rightWheel.encoderCount;
+    sharedState.filtR = rightWheel.filteredSpeed;
+    sharedState.targetR = rightWheel.targetSpeed;
+    sharedState.debug_fR = rightWheel.debug_f;
+    sharedState.debug_pR = rightWheel.debug_p;
+    sharedState.debug_iR = rightWheel.debug_i;
+    sharedState.debug_outR = rightWheel.debug_out;
+    portEXIT_CRITICAL(&sharedVarMux);
+  }
+}
+
 //
 // MAIN
 //
@@ -463,35 +581,25 @@ void setup() {
   Serial.print(":");
   Serial.println(WS_PORT);
 
-  // Initialize failsafe timer
-  lastHeartbeatTime = 0;
+  // Create the Motor Task
+  // 4096 = Stack size (bytes)
+  // 5    = Priority (1 is low, 24 is high). 5 is high enough to beat WiFi.
+  // 1    = Core ID (0 or 1). Arduino runs on 1.
+  xTaskCreatePinnedToCore(motorTask,       // Function
+                          "MotorControl",  // Name
+                          4096,            // Stack size
+                          NULL,            // Parameters
+                          5,               // Priority (High!)
+                          &motorTaskHandle,
+                          1  // Core
+  );
 }
 
 void loop() {
   int64_t now = esp_timer_get_time();
 
-  // 1. Network - Process WebSocket events
   webSocket.loop();
 
-  // 2. Failsafe: Stop if no heartbeat received
-  if (lastHeartbeatTime > 0 &&
-      (now - lastHeartbeatTime) > HEARTBEAT_TIMEOUT_MICROS) {
-    leftWheel.stop();
-    rightWheel.stop();
-    lastHeartbeatTime = 0;
-    Serial.println("Failsafe: No heartbeat received, stopping robot");
-  }
-
-  //   3. Control Loop
-  static int64_t lastControl = 0;
-  if (now - lastControl >= CONTROL_PERIOD_MICROS) {
-    int64_t dt = now - lastControl;
-    lastControl = now;
-    leftWheel.update(dt);
-    rightWheel.update(dt);
-  }
-
-  // 4. Reporting
   sendTelemetry();
   streamCamera(now);
 }

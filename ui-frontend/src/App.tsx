@@ -139,11 +139,15 @@ const LiveChart = ({
 	dataKeys,
 	colors,
 	title,
+	min,
+	max,
 }: {
 	dataRef: React.RefObject<ChartPoint[]>;
 	dataKeys: string[];
 	colors: string[];
 	title: string;
+	min: number;
+	max: number;
 }) => {
 	const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -169,19 +173,6 @@ const LiveChart = ({
 		const data = dataRef.current;
 		if (!data || data.length < 2) return;
 
-		let min = Infinity;
-		let max = -Infinity;
-		data.forEach((pt: ChartPoint) => {
-			dataKeys.forEach((key: string) => {
-				const val = pt[key];
-				if (val < min) min = val;
-				if (val > max) max = val;
-			});
-		});
-		const range = max - min || 1;
-		min -= range * 0.1;
-		max += range * 0.1;
-
 		const mapX = (i: number) => (i / (MAX_POINTS - 1)) * width;
 		const mapY = (val: number) =>
 			cvsHeight - ((val - min) / (max - min)) * cvsHeight;
@@ -199,7 +190,7 @@ const LiveChart = ({
 			}
 			ctx.stroke();
 		});
-	}, [dataRef, dataKeys, colors]);
+	}, [dataRef, dataKeys, colors, min, max]);
 
 	useEffect(() => {
 		let animId: number;
@@ -217,7 +208,12 @@ const LiveChart = ({
 				<Text textStyle="label" fontWeight="bold">
 					{title}
 				</Text>
-				<Activity size={14} style={{ opacity: 0.5 }} />
+				<Flex align="center" gap={2}>
+					<Text textStyle="monoVal" fontSize="xs" color="fg.muted">
+						[{min.toFixed(2)} - {max.toFixed(2)}]
+					</Text>
+					<Activity size={14} style={{ opacity: 0.5 }} />
+				</Flex>
 			</Flex>
 			<Box layerStyle="readout" h="160px" position="relative" overflow="hidden">
 				<canvas
@@ -441,24 +437,32 @@ export default function RobotDashboard() {
 								dataRef={chartDataRef}
 								dataKeys={["left_target", "left_measured"]}
 								colors={["red", "#00A3C4"]}
+								min={-3.0}
+								max={3.0}
 							/>
 							<LiveChart
 								title="Right Velocity"
 								dataRef={chartDataRef}
 								dataKeys={["right_target", "right_measured"]}
 								colors={["red", "#00A3C4"]}
+								min={-3.0}
+								max={3.0}
 							/>
 							<LiveChart
 								title="Left PID"
 								dataRef={chartDataRef}
 								dataKeys={["left_pwm", "left_p", "left_i"]}
 								colors={["white", "orange", "purple"]}
+								min={-300}
+								max={300}
 							/>
 							<LiveChart
 								title="Right PID"
 								dataRef={chartDataRef}
 								dataKeys={["right_pwm", "right_p", "right_i"]}
 								colors={["white", "orange", "purple"]}
+								min={-300}
+								max={300}
 							/>
 						</Grid>
 
@@ -540,7 +544,6 @@ export default function RobotDashboard() {
 								<Button
 									layerStyle="ctrlBtn"
 									onMouseDown={() => handleDrive("fwd")}
-									onMouseUp={() => handleDrive("stop")}
 								>
 									<ArrowUp />
 								</Button>
@@ -549,21 +552,19 @@ export default function RobotDashboard() {
 								<Button
 									layerStyle="ctrlBtn"
 									onMouseDown={() => handleDrive("left")}
-									onMouseUp={() => handleDrive("stop")}
 								>
 									<ArrowLeft />
 								</Button>
 								<Button
 									layerStyle="ctrlBtn"
 									color="red.500"
-									onClick={() => handleDrive("stop")}
+									onMouseDown={() => handleDrive("stop")}
 								>
 									<Square size={12} fill="currentColor" />
 								</Button>
 								<Button
 									layerStyle="ctrlBtn"
 									onMouseDown={() => handleDrive("right")}
-									onMouseUp={() => handleDrive("stop")}
 								>
 									<ArrowRight />
 								</Button>
@@ -572,7 +573,6 @@ export default function RobotDashboard() {
 								<Button
 									layerStyle="ctrlBtn"
 									onMouseDown={() => handleDrive("back")}
-									onMouseUp={() => handleDrive("stop")}
 								>
 									<ArrowDown />
 								</Button>

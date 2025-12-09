@@ -25,7 +25,7 @@ const char *AP_PASS = "robot1234";  // Must be at least 8 chars
 #define PIN_IN1_L 44
 #define PIN_IN2_L 2
 #define PWM_CHAN_L 2  // Channel 0 is taken by Camera! Using 2.
-#define TUNING_L {90.0, 10.0, 40.0, 30.0}  // {ks, kf, kp, ki}
+#define TUNING_L {120.0, 10.0, 40.0, 30.0}  // {ks, kf, kp, ki}
 
 // Right Wheel. it has a bigger ks because it has more static friction
 #define PIN_ENC_R 47
@@ -42,19 +42,18 @@ const char *AP_PASS = "robot1234";  // Must be at least 8 chars
 #define INTEGRATOR_CLAMP 6.0
 // SPEED_FILTER_ALPHA the lower you make it, the slower is the exponential
 // average:
-#define SPEED_FILTER_ALPHA 0.15
+#define SPEED_FILTER_ALPHA 0.1
 
-#define MAX_ACCEL 0.3
-#define DITHER_MAGNITUDE 60.0
+#define MAX_ACCEL 0.4
+#define DITHER_MAGNITUDE 70.0
 
 // --- Timing ---
-#define CONTROL_PERIOD_MICROS 25e3
+#define CONTROL_PERIOD_MICROS 10e3
 #define TELEMETRY_PERIOD_MICROS 50e3
 #define FRAME_STREAM_PERIOD_MICROS 200e3
 #define PWM_FREQ 5000
 #define PWM_RES 8
-#define HEARTBEAT_TIMEOUT_MICROS 500e3  // 500ms timeout
-
+#define HEARTBEAT_TIMEOUT_MICROS 3000e3
 //
 
 // DATA STRUCTURES
@@ -63,6 +62,8 @@ const char *AP_PASS = "robot1234";  // Must be at least 8 chars
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 // Mutex for protecting variables shared between loop() and motorTask()
 portMUX_TYPE sharedVarMux = portMUX_INITIALIZER_UNLOCKED;
+
+esp_timer_handle_t controlTimer;
 
 struct PidConfig {
   double ks, kf, kp, ki;
@@ -497,60 +498,107 @@ void streamCamera(int64_t now) {
 // Task Handle to manage the task if needed
 TaskHandle_t motorTaskHandle = NULL;
 
-void motorTask(void *parameter) {
-  const TickType_t xFrequency = pdMS_TO_TICKS(20);
-  TickType_t xLastWakeTime = xTaskGetTickCount();
+// void motorTask(void *parameter) {
+//   const TickType_t xFrequency = pdMS_TO_TICKS(20);
+//   TickType_t xLastWakeTime = xTaskGetTickCount();
 
-  for (;;) {
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+//   for (;;) {
+//     vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
-    // --- PHASE 1: IMPORT DATA (CRITICAL SECTION) ---
-    double tL, tR;
-    int64_t hb;
+//     // --- PHASE 1: IMPORT DATA (CRITICAL SECTION) ---
+//     double tL, tR;
+//     int64_t hb;
 
-    portENTER_CRITICAL(&sharedVarMux);
-    tL = sharedCommand.targetL;
-    tR = sharedCommand.targetR;
-    hb = sharedCommand.lastHeartbeat;
-    portEXIT_CRITICAL(&sharedVarMux);
+//     portENTER_CRITICAL(&sharedVarMux);
+//     tL = sharedCommand.targetL;
+//     tR = sharedCommand.targetR;
+//     hb = sharedCommand.lastHeartbeat;
+//     portEXIT_CRITICAL(&sharedVarMux);
 
-    // --- PHASE 2: LOGIC & PHYSICS (NO LOCKS REQUIRED) ---
-    // The wheels are "private" to this task now. safely write to them.
+//     // --- PHASE 2: LOGIC & PHYSICS (NO LOCKS REQUIRED) ---
+//     // The wheels are "private" to this task now. safely write to them.
 
-    // Failsafe Logic
-    int64_t now = esp_timer_get_time();
-    if (hb > 0 && (now - hb) > HEARTBEAT_TIMEOUT_MICROS) {
-      leftWheel.stop();
-      rightWheel.stop();
-      // Optional: Update shared heartbeat to 0 to signal stop?
-      // Usually not strictly necessary if client sends new hb later.
-    } else {
-      leftWheel.targetSpeed = tL;
-      rightWheel.targetSpeed = tR;
+//     // Failsafe Logic
+//     int64_t now = esp_timer_get_time();
+//     if (hb > 0 && (now - hb) > HEARTBEAT_TIMEOUT_MICROS) {
+//       leftWheel.stop();
+//       rightWheel.stop();
+//       // Optional: Update shared heartbeat to 0 to signal stop?
+//       // Usually not strictly necessary if client sends new hb later.
+//     } else {
+//       leftWheel.targetSpeed = tL;
+//       rightWheel.targetSpeed = tR;
 
-      leftWheel.update();
-      rightWheel.update();
-    }
+//       leftWheel.update();
+//       rightWheel.update();
+//     }
 
-    // --- PHASE 3: EXPORT DATA (CRITICAL SECTION) ---
-    portENTER_CRITICAL(&sharedVarMux);
-    sharedState.encL = leftWheel.encoderCount;
-    sharedState.filtL = leftWheel.filteredSpeed;
-    sharedState.targetL = leftWheel.targetSpeed;
-    sharedState.debug_fL = leftWheel.debug_f;
-    sharedState.debug_pL = leftWheel.debug_p;
-    sharedState.debug_iL = leftWheel.debug_i;
-    sharedState.debug_outL = leftWheel.debug_out;
+//     // --- PHASE 3: EXPORT DATA (CRITICAL SECTION) ---
+//     portENTER_CRITICAL(&sharedVarMux);
+//     sharedState.encL = leftWheel.encoderCount;
+//     sharedState.filtL = leftWheel.filteredSpeed;
+//     sharedState.targetL = leftWheel.targetSpeed;
+//     sharedState.debug_fL = leftWheel.debug_f;
+//     sharedState.debug_pL = leftWheel.debug_p;
+//     sharedState.debug_iL = leftWheel.debug_i;
+//     sharedState.debug_outL = leftWheel.debug_out;
 
-    sharedState.encR = rightWheel.encoderCount;
-    sharedState.filtR = rightWheel.filteredSpeed;
-    sharedState.targetR = rightWheel.targetSpeed;
-    sharedState.debug_fR = rightWheel.debug_f;
-    sharedState.debug_pR = rightWheel.debug_p;
-    sharedState.debug_iR = rightWheel.debug_i;
-    sharedState.debug_outR = rightWheel.debug_out;
-    portEXIT_CRITICAL(&sharedVarMux);
+//     sharedState.encR = rightWheel.encoderCount;
+//     sharedState.filtR = rightWheel.filteredSpeed;
+//     sharedState.targetR = rightWheel.targetSpeed;
+//     sharedState.debug_fR = rightWheel.debug_f;
+//     sharedState.debug_pR = rightWheel.debug_p;
+//     sharedState.debug_iR = rightWheel.debug_i;
+//     sharedState.debug_outR = rightWheel.debug_out;
+//     portEXIT_CRITICAL(&sharedVarMux);
+//   }
+// }
+
+void IRAM_ATTR onControlLoop(void *arg) {
+  // --- PHASE 1: IMPORT DATA (CRITICAL SECTION) ---
+  double tL, tR;
+  int64_t hb;
+
+  // Use a spinlock (portMUX) which is safe in ISRs
+  portENTER_CRITICAL_ISR(&sharedVarMux);
+  tL = sharedCommand.targetL;
+  tR = sharedCommand.targetR;
+  hb = sharedCommand.lastHeartbeat;
+  portEXIT_CRITICAL_ISR(&sharedVarMux);
+
+  // --- PHASE 2: LOGIC & PHYSICS ---
+  int64_t now = esp_timer_get_time();
+
+  // Failsafe Logic
+  if (hb > 0 && (now - hb) > HEARTBEAT_TIMEOUT_MICROS) {
+    leftWheel.stop();
+    rightWheel.stop();
+  } else {
+    leftWheel.targetSpeed = tL;
+    rightWheel.targetSpeed = tR;
+
+    leftWheel.update();
+    rightWheel.update();
   }
+
+  // --- PHASE 3: EXPORT DATA ---
+  portENTER_CRITICAL_ISR(&sharedVarMux);
+  sharedState.encL = leftWheel.encoderCount;
+  sharedState.filtL = leftWheel.filteredSpeed;
+  sharedState.targetL = leftWheel.targetSpeed;
+  sharedState.debug_fL = leftWheel.debug_f;
+  sharedState.debug_pL = leftWheel.debug_p;
+  sharedState.debug_iL = leftWheel.debug_i;
+  sharedState.debug_outL = leftWheel.debug_out;
+
+  sharedState.encR = rightWheel.encoderCount;
+  sharedState.filtR = rightWheel.filteredSpeed;
+  sharedState.targetR = rightWheel.targetSpeed;
+  sharedState.debug_fR = rightWheel.debug_f;
+  sharedState.debug_pR = rightWheel.debug_p;
+  sharedState.debug_iR = rightWheel.debug_i;
+  sharedState.debug_outR = rightWheel.debug_out;
+  portEXIT_CRITICAL_ISR(&sharedVarMux);
 }
 
 //
@@ -581,18 +629,18 @@ void setup() {
   Serial.print(":");
   Serial.println(WS_PORT);
 
-  // Create the Motor Task
-  // 4096 = Stack size (bytes)
-  // 5    = Priority (1 is low, 24 is high). 5 is high enough to beat WiFi.
-  // 1    = Core ID (0 or 1). Arduino runs on 1.
-  xTaskCreatePinnedToCore(motorTask,       // Function
-                          "MotorControl",  // Name
-                          4096,            // Stack size
-                          NULL,            // Parameters
-                          5,               // Priority (High!)
-                          &motorTaskHandle,
-                          1  // Core
-  );
+  const esp_timer_create_args_t periodic_timer_args = {
+      .callback = &onControlLoop, .name = "control_loop"};
+
+  ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &controlTimer));
+
+  // Start the timer.
+  // 10000 micros = 10ms (100Hz Control Loop).
+  // This gives a 50Hz Dither frequency, which is much smoother.
+  ESP_ERROR_CHECK(
+      esp_timer_start_periodic(controlTimer, CONTROL_PERIOD_MICROS));
+
+  Serial.println("High-Precision Control Loop Started");
 }
 
 void loop() {

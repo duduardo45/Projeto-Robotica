@@ -48,7 +48,7 @@ const char *AP_PASS = "robot1234";  // Must be at least 8 chars
 #define DITHER_MAGNITUDE 70.0
 
 // --- Timing ---
-#define CONTROL_PERIOD_MICROS 10e3
+#define CONTROL_PERIOD_MICROS 30e3
 #define TELEMETRY_PERIOD_MICROS 50e3
 #define FRAME_STREAM_PERIOD_MICROS 200e3
 #define PWM_FREQ 5000

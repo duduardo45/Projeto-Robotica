@@ -49,7 +49,9 @@ const char *AP_PASS = "robot1234";  // Must be at least 8 chars
 
 // --- Timing ---
 #define CONTROL_PERIOD_MICROS 30e3
-#define TELEMETRY_PERIOD_MICROS 50e3
+#define TELEMETRY_PERIOD_MICROS \
+  50e3  // to get accurate telemetry, maybe this needs to be faster than the
+        // control loop?
 #define FRAME_STREAM_PERIOD_MICROS 200e3
 #define PWM_FREQ 5000
 #define PWM_RES 8

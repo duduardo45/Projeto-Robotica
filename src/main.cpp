@@ -5,7 +5,7 @@
 #include <esp_camera.h>
 
 #include "camera_pins.h"
-#include "credentials.h"
+// #include "credentials.h"
 // DO NOT DO NEOPIXEL WRITE BECAUSE WE COULD BE USING ITS PIN
 //
 // CONFIGURATION

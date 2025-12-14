@@ -5,8 +5,8 @@ Este repositório contém informações sobre o projeto de uma empilhadeira aut�
 O trabalho foi realizado pelo grupo composto por:
  - Eduardo Eugênio de Souza
  - Enzo Mediano
- - Luiza Silveira
- - Luiz Felipe Neves Batista
+ - Luisa Silveira
+ - Luiz Felipe @ Batista
 
 ## Objetivo
 

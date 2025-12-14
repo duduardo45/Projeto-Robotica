@@ -54,7 +54,7 @@ Todas as peças estruturais foram projetadas em CAD e impressas em 3D. Os arquiv
 1. **Motor Elevation Base** - Não foi impresso devido ao tempo limitado do projeto
 2. **Roof (teto completo)** - Foi impresso, mas não montado. Esta peça seguraria o motor de elevação que ficaria em cima do roof holder. Como não foi implementada, o motor de elevação permaneceu dentro do chassis do robô
 3. **Organização de fiação** - Como a câmera utilizada era integrada ao ESP32 e ele ficou posicionado no alto (em cima da guia), muitos fios ficaram expostos e desorganizados, comprometendo a estética do projeto. Com mais tempo, seria implementada uma calha para passagem de fios na guia
-4. ** Polia"" - Preferimos conectar os fios diretamente ao motor de elevação, sem utilizar a polia impressa. Isso simplificou a montagem e evitou possíveis problemas mecânicos"
+4. ** Polia** - Preferimos conectar os fios diretamente ao motor de elevação, sem utilizar a polia impressa. Isso simplificou a montagem e evitou possíveis problemas mecânicos"
 
 ### Montagem Final
 
@@ -448,7 +448,6 @@ Infelizmente, não tivemos tempo de implementar o código de controle para o mot
 - Motor DC com encoder
 - Sistema de polias e guias impressas em 3D
 - Driver de motor conectado ao ESP32
-- Sensor de fim de curso (opcional)
 
 **O que faltou:** Implementação do código de controle no firmware, incluindo:
 

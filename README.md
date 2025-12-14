@@ -92,7 +92,6 @@ O robô foi montado com:
 #### **Sistema de Alimentação:**
 
 - **3x Baterias 18650** em série → **12V total**
-  - Regulador de tensão **12V → 5V** para ESP32 (aproximadamente 4V utilizável)
   - **12V direto** para os motores DC
   - ⚠️ **BMS não implementado** - Por limitação de tempo, não foi utilizado Battery Management System. Isso seria uma melhoria importante para segurança e longevidade das baterias
 
@@ -104,7 +103,6 @@ O robô foi montado com:
   - Controle via Ponte H
 - **1x Motor DC para elevação do garfo**
   - Hardware montado e conectado
-  - Sistema de passagem dos fios instalado
   - ⚠️ Software não implementado
 
 #### **Drivers e Interfaces:**
@@ -112,24 +110,9 @@ O robô foi montado com:
 - **Ponte H (H-Bridge)** para controle bidirecional dos motores
   - Controle de direção (pinos IN1, IN2)
   - Controle de velocidade via PWM
-  - Suporta os 3 motores (2 de locomoção + 1 de elevação)
+  - Duas Ponte H (uma para motores de locomoção e uma para o de elevação)
 - **Encoders ópticos** conectados via interrupção
-- **Reguladores de tensão** para conversão 12V → 5V
-
-### Diagrama de Conexões
-
-```
-[Baterias 18650] (3x em série = 12V)
-    │
-    ├─→ [Regulador 12V→5V] → ESP32-S3 + Câmera
-    │
-    └─→ [Ponte H] → Motores DC (12V)
-            ├─→ Motor Esquerdo + Encoder
-            ├─→ Motor Direito + Encoder
-            └─→ Motor Elevação (não implementado em software)
-```
-
----
+  
 
 ## 3️⃣ Solução de Comunicação
 
@@ -261,7 +244,7 @@ A montagem do robô seguiu as seguintes etapas:
 
 #### **1. Impressão 3D das Peças**
 
-Todas as peças foram impressas em PLA/ABS utilizando os arquivos STL disponíveis:
+Todas as peças foram impressas utilizando os arquivos STL disponíveis:
 
 - Estrutura do garfo e guias
 - Compartimentos para eletrônica
@@ -269,8 +252,7 @@ Todas as peças foram impressas em PLA/ABS utilizando os arquivos STL disponíve
 
 #### **2. Montagem da Estrutura Base**
 
-- Fixação do chassis principal
-- Instalação das rodas motorizadas
+- Montagem do teto do robô
 - Montagem do compartimento de baterias
 - Instalação do contrapeso para balanceamento
 
@@ -278,7 +260,7 @@ Todas as peças foram impressas em PLA/ABS utilizando os arquivos STL disponíve
 
 - Instalação da guia vertical (15cm)
 - Fixação do garfo móvel
-- Montagem do sistema de polias
+- Montagem do sistema onde passam os fios
 - Conexão do motor de elevação (hardware pronto)
 
 #### **4. Integração Eletrônica**
@@ -287,7 +269,6 @@ Todas as peças foram impressas em PLA/ABS utilizando os arquivos STL disponíve
 - Conexão da Ponte H aos motores
 - Fiação das baterias (3x em série = 12V)
 - Conexão dos encoders
-- Instalação do regulador de tensão
 
 #### **5. Limitações da Montagem**
 

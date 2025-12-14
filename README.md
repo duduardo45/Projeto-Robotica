@@ -475,13 +475,20 @@ Durante o desenvolvimento, enfrentamos alguns desafios importantes que impactara
    - Zona morta maior que o ideal no sistema de acionamento
 
 3. **Navegação autônoma imprecisa**
+
    - A navegação para pontos específicos não estava 100% precisa
    - Desvios acumulativos devido ao atrito e problemas mecânicos
    - Dificuldade em manter trajetória reta por longas distâncias
    - Necessidade de ajuste fino dos ganhos do controlador
-   - Limitações na calibração da câmera e detecção de AprilTags em condições de iluminação variável
 
-Estes problemas mecânicos e de atrito impactaram significativamente a performance do sistema autônomo, demonstrando a importância da integração mecânica, eletrônica e de software em projetos de robótica.
+4. **Latência na comunicação WiFi**
+   - Atraso na transmissão de informações no modo manual
+   - Possível instabilidade da conexão WiFi em tempo real
+   - Impactou a responsividade e controle direto do robô
+   - Comandos demoravam alguns milissegundos para chegar
+   - Feedback de telemetria não era tão rápido quanto ideal
+
+Estes problemas mecânicos, de atrito e de comunicação impactaram significativamente a performance do sistema autônomo e manual, demonstrando a importância da integração mecânica, eletrônica e de software em projetos de robótica.
 
 ### ✅ O que foi concluído com sucesso
 
@@ -515,8 +522,29 @@ Estes problemas mecânicos e de atrito impactaram significativamente a performan
 
 ### 🔮 Melhorias Futuras
 
-- Implementar controle do garfo de elevação
+#### **Software - Comunicação**
+
+- Otimizar comunicação WiFi para reduzir latência
+- Implementar compressão de dados para mais rápida transmissão
+- Aumentar frequência de heartbeat
+- Otimizar protocolo WebSocket
+
+#### **Software - Controle de Elevação**
+
+- Implementar controle manual do garfo (subir/descer)
+- Implementar controle autônomo do garfo em missões
+- Integrar interface gráfica para controle da elevação
+
+#### **Hardware e Mecânica**
+
+- Pensar em estratégias para lidar com o atrito do piso
+- Implementar BMS para segurança das baterias
+- Imprimir as peças não montadas (Motor Elevation Base, Roof) e montá-las corretamente
+- Adicionar sensor de fim de curso para detectar quando o pallet está posicionado
 - Adicionar sensor ultrassônico para detecção de obstáculos
+
+#### **Algoritmos Avançados**
+
 - Implementar SLAM para mapeamento do ambiente
 - Melhorar odometria com fusão de sensores (IMU)
 - Adicionar planejamento de trajetória (A\*, RRT)

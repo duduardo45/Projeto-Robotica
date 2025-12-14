@@ -6,7 +6,7 @@ O trabalho foi realizado pelo grupo composto por:
  - Eduardo Eugênio de Souza
  - Enzo Mediano
  - Luisa Silveira
- - Luiz Felipe @ Batista
+ - Luiz Felipe Neves Batista
 
 ## Objetivo
 

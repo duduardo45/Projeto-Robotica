@@ -54,8 +54,8 @@ Todas as peças estruturais foram projetadas em CAD e impressas em 3D. Os arquiv
 Algumas peças foram modeladas mas não foram utilizadas na montagem final:
 
 - [Battery Support (Suporte de Bateria)](Modelagem3D/Battery%20Container%20Support.stl) - Não foi utilizado pois se tornou redundante, já que o compartimento de baterias conseguia ser travado através do teto (roof) e havia a necessidade de passagem de fios pela parte inferior do suporte.
-- [Motor Holder (Suporte do Motor)](Modelagem3D/Motor%20Holder.stl) - Não houve tempo hábil para instalar o componente, porém a situação foi contornada através da utilização de um placeholder na parte traseira do robô.
-- [Polia](Modelagem3D/Polia%20-%20Part%201.stl) - Devido à utilização do placeholder na parte traseira do robô, a polia acabou não sendo utilizada por conta de conflitos com essa mudança repentina no projeto.
+- [Motor Holder (Suporte do Motor)](Modelagem3D/Motor%20Holder.stl) - Não houve tempo hábil para instalar o componente.
+- [Polia](Modelagem3D/Polia%20-%20Part%201.stl) - A polia acabou não sendo utilizada, preferindo conectar o fio que levanta o garfo diretamente no motor.
 
 #### **Limitações de Tempo na Montagem:**
 
@@ -69,7 +69,7 @@ Algumas peças foram modeladas mas não foram utilizadas na montagem final:
 O robô foi montado com:
 
 - Garfo móvel com guia de elevação de 15cm
-- itema de passagem dos fios que puxam o garfo
+- sistema de passagem dos fios que puxam o garfo
 - Compartimento de baterias integrado
 - Teto para o chassis (roof holder)
 - Contrapeso para balanceamento
@@ -104,7 +104,7 @@ O robô foi montado com:
   - Controle via Ponte H
 - **1x Motor DC para elevação do garfo**
   - Hardware montado e conectado
-  - Sistema de polias instalado
+  - Sistema de passagem dos fios instalado
   - ⚠️ Software não implementado
 
 #### **Drivers e Interfaces:**
@@ -266,7 +266,6 @@ Todas as peças foram impressas em PLA/ABS utilizando os arquivos STL disponíve
 - Estrutura do garfo e guias
 - Compartimentos para eletrônica
 - Suportes e fixações
-- Sistema de polias
 
 #### **2. Montagem da Estrutura Base**
 
@@ -317,7 +316,7 @@ O robô foi montado com:
 - ✅ Chassis estrutural completo
 - ✅ Sistema de locomoção com 2 motores + encoders
 - ✅ Garfo com guia de 15cm
-- ✅ Sistema de polias instalado
+- ✅ Sistema de passagem do fios
 - ✅ ESP32 com câmera integrada
 - ✅ Ponte H para controle dos motores
 - ✅ Sistema de baterias (3x 18650 em série)
@@ -454,7 +453,7 @@ pnpm dev
 Infelizmente, não tivemos tempo de implementar o código de controle para o motor de elevação do garfo. A **parte mecânica e eletrônica estava completa**, incluindo:
 
 - Motor DC com encoder
-- Sistema de polias e guias impressas em 3D
+- Sistema da passagem dos fios, guias e garfo impressas em 3D
 - Driver de motor conectado ao ESP32
 
 **O que faltou:** Implementação do código de controle no firmware, incluindo:

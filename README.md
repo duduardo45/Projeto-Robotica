@@ -49,6 +49,14 @@ Todas as peças estruturais foram projetadas em CAD e impressas em 3D. Os arquiv
 - [Roof Holder - Parts 1-4](Modelagem3D/) - Suportes para o teto do robô
 - [Suporte Motor Elevação](Modelagem3D/suporte%20motor%20elevação%20-%20Part%201.stl) - Base do motor de elevação
 
+#### **Modelagens Não Utilizadas:**
+
+Algumas peças foram modeladas mas não foram utilizadas na montagem final:
+
+- **Battery Support (Suporte de Bateria):** Não foi utilizado pois se tornou redundante, já que o compartimento de baterias conseguia ser travado através do teto (roof) e havia a necessidade de passagem de fios pela parte inferior do suporte.
+- **Motor Holder (Suporte do Motor):** Não houve tempo hábil para instalar o componente, porém a situação foi contornada através da utilização de um placeholder na parte traseira do robô.
+- **Polia:** Devido à utilização do placeholder na parte traseira do robô, a polia acabou não sendo utilizada por conta de conflitos com essa mudança repentina no projeto.
+
 #### **Limitações de Tempo na Montagem:**
 
 1. **Motor Elevation Base** - Não foi impresso devido ao tempo limitado do projeto

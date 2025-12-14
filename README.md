@@ -19,181 +19,347 @@ O desafio proposto foi desenvolver uma empilhadeira autônoma com os seguintes r
 - **Leitura de AprilTags** para localização no terreno e identificação de pallets
 - **Alimentação** por baterias 18650
 
-## 🏗️ Estrutura do Projeto
+## 🏗️ Arquitetura do Sistema
 
-O projeto está organizado em quatro componentes principais:
-
-### 1. Firmware do ESP32 (`src/`)
-
-Código embarcado rodando no microcontrolador ESP32-S3 DevKitC-1.
-
-### 2. Backend Python (`ui/`)
-
-Servidor intermediário responsável pelo processamento de visão computacional e controle autônomo.
-
-### 3. Frontend Web (`ui-frontend/`)
-
-Interface de usuário moderna desenvolvida em React + TypeScript para controle e monitoramento.
-
-### 4. Modelagem 3D (`Modelagem3D/`)
-
-Peças estruturais do robô projetadas e impressas em 3D.
+O projeto foi desenvolvido seguindo uma abordagem integrada de hardware e software, dividido em 5 soluções principais:
 
 ---
 
-## 💻 Sistema de Software
+## 1️⃣ Solução Mecânica
+
+### Projeto e Construção
+
+Todas as peças estruturais foram projetadas em CAD e impressas em 3D. Os arquivos STL estão disponíveis na pasta [Modelagem3D](Modelagem3D/).
+
+#### **Componentes Mecânicos Projetados:**
+
+**Garfo e Sistema de Elevação:**
+
+- [Guia + Garfo - Part 1](<Modelagem3D/Guia%20+%20Garfo%20-%20Part%201%20(4).stl>) - Estrutura principal do garfo
+- [Guia + Garfo - Part 2](<Modelagem3D/Guia%20+%20Garfo%20-%20Part%202%20(3).stl>) - Componente secundário do garfo
+- [Guia + Garfo - Part 4](Modelagem3D/Guia%20+%20Garfo%20-%20Part%204.stl) - Suporte adicional
+- Guia vertical de **15 cm** para elevação do garfo
+- Sistema de polias para transmissão ([Polia - Part 1](Modelagem3D/Polia%20-%20Part%201.stl))
+
+**Estrutura e Suportes:**
+
+- [Case Baterias](Modelagem3D/Case_Baterias%20-%20Part%201.stl) - Compartimento para baterias 18650
+- [Case Contrapeso](Modelagem3D/Case-Contrapeso%20-%20Part%202.stl) - Peso para balanceamento
+- [Suporte ESP32 - Part 1](<Modelagem3D/Suporte%20esp32%20-%20Part%201%20(1).stl>) e [Part 2](<Modelagem3D/Suporte%20esp32%20-%20Part%202%20(1).stl>) - Fixação do microcontrolador
+- [Roof Holder - Parts 1-4](Modelagem3D/) - Suportes para o teto do robô
+- [Suporte Motor Elevação](Modelagem3D/suporte%20motor%20elevação%20-%20Part%201.stl) - Base do motor de elevação
+
+#### **Limitações de Tempo na Montagem:**
+
+1. **Motor Elevation Base** - Não foi impresso devido ao tempo limitado do projeto
+2. **Roof (teto completo)** - Foi impresso, mas não montado. Esta peça seguraria o motor de elevação que ficaria em cima do roof holder. Como não foi implementada, o motor de elevação permaneceu dentro do chassis do robô
+3. **Organização de fiação** - Como a câmera utilizada era integrada ao ESP32 e ele ficou posicionado no alto (em cima da guia), muitos fios ficaram expostos e desorganizados, comprometendo a estética do projeto. Com mais tempo, seria implementada uma calha para passagem de fios na guia
+4. ** Polia"" - Preferimos conectar os fios diretamente ao motor de elevação, sem utilizar a polia impressa. Isso simplificou a montagem e evitou possíveis problemas mecânicos"
+
+### Montagem Final
+
+O robô foi montado com:
+
+- Garfo móvel com guia de elevação de 15cm
+- itema de passagem dos fios que puxam o garfo
+- Compartimento de baterias integrado
+- Teto para o chassis (roof holder)
+- Contrapeso para balanceamento
+- ESP32 com câmera posicionado na parte superior
+
+---
+
+## 2️⃣ Solução Eletrônica
+
+### Componentes Utilizados
+
+#### **Microcontrolador:**
+
+- **ESP32-S3 DevKitC-1** (16MB Flash, PSRAM)
+  - WiFi integrado para comunicação
+  - Câmera OV2640 integrada (320x240)
+  - 2x Timer hardware para controle preciso
+  - Múltiplos canais PWM
+
+#### **Sistema de Alimentação:**
+
+- **3x Baterias 18650** em série → **12V total**
+  - Regulador de tensão **12V → 5V** para ESP32 (aproximadamente 4V utilizável)
+  - **12V direto** para os motores DC
+  - ⚠️ **BMS não implementado** - Por limitação de tempo, não foi utilizado Battery Management System. Isso seria uma melhoria importante para segurança e longevidade das baterias
+
+#### **Motorização:**
+
+- **2x Motores DC com encoder** (locomoção)
+  - 64 pulsos por rotação
+  - Alimentação: 12V
+  - Controle via Ponte H
+- **1x Motor DC para elevação do garfo**
+  - Hardware montado e conectado
+  - Sistema de polias instalado
+  - ⚠️ Software não implementado
+
+#### **Drivers e Interfaces:**
+
+- **Ponte H (H-Bridge)** para controle bidirecional dos motores
+  - Controle de direção (pinos IN1, IN2)
+  - Controle de velocidade via PWM
+  - Suporta os 3 motores (2 de locomoção + 1 de elevação)
+- **Encoders ópticos** conectados via interrupção
+- **Reguladores de tensão** para conversão 12V → 5V
+
+### Diagrama de Conexões
+
+```
+[Baterias 18650] (3x em série = 12V)
+    │
+    ├─→ [Regulador 12V→5V] → ESP32-S3 + Câmera
+    │
+    └─→ [Ponte H] → Motores DC (12V)
+            ├─→ Motor Esquerdo + Encoder
+            ├─→ Motor Direito + Encoder
+            └─→ Motor Elevação (não implementado em software)
+```
+
+---
+
+## 3️⃣ Solução de Comunicação
+
+### Arquitetura de Comunicação
+
+O sistema utiliza uma arquitetura de três camadas:
+
+```
+[Frontend Web] ↔ [Backend Python] ↔ [ESP32]
+   (React)      WebSocket/HTTP      WebSocket
+```
+
+### Protocolo de Comunicação
+
+#### **ESP32 ↔ Backend Python:**
+
+- **WebSocket** na porta 8000
+- **Formato:** JSON (comandos e telemetria) + Binário (imagens)
+- **Taxa de telemetria:** 20Hz (50ms)
+- **Taxa de vídeo:** 5fps (200ms)
+
+#### **Backend ↔ Frontend:**
+
+- **WebSocket** para dados em tempo real
+- **REST API** para comandos pontuais
+- **Broadcast** de estado para múltiplos clientes
+
+### Mecanismos de Fail-Safe
+
+1. **Heartbeat System:**
+
+   - Cliente deve enviar heartbeat a cada 200ms
+   - Timeout de 3 segundos sem heartbeat → parada automática dos motores
+   - Implementado via timestamp no ESP32
+
+2. **Watchdog de Conexão:**
+
+   - Detecção de desconexão WebSocket
+   - Parada segura em caso de perda de comunicação
+
+3. **Validação de Comandos:**
+   - Limites de velocidade no firmware
+   - Validação de JSON no backend
+
+### Interface de Controle
+
+- **Interface Web moderna** (React + TypeScript)
+- **Controle manual** via teclado (WASD)
+- **Controle autônomo** via waypoints
+- **Visualização em tempo real** de câmera e telemetria
+- **Gráficos de debug** para ajuste de PID
+
+---
+
+## 4️⃣ Solução de Controle
+
+### Controle em Malha Aberta vs Malha Fechada
+
+O sistema implementa controle em **malha fechada** para os motores de locomoção, utilizando feedback dos encoders para correção contínua.
+
+### 🎯 Controlador PID
+
+O firmware implementa um controlador PID otimizado para cada roda:
+
+#### **Componentes do Controlador:**
+
+1. **Termo Proporcional (P):** `kp × erro`
+
+   - Correção proporcional ao erro de velocidade
+   - kp = 40.0 (ajustado experimentalmente)
+
+2. **Termo Integral (I):** `ki × ∫erro·dt`
+
+   - Elimina erro em regime permanente
+   - ki = 30.0
+   - **Anti-windup:** Limita integrador a ±6.0 para evitar saturação
+
+3. **Feedforward (F):** `kf × velocidade_desejada`
+
+   - Compensação antecipada da velocidade
+   - kf = 10.0
+
+4. **Termo Estático (S):** `ks`
+
+   - Constante para vencer atrito estático inicial
+   - ks = 120.0
+
+5. **Dithering:**
+   - Vibração de 25Hz (±70 PWM) para reduzir zona morta
+   - Elimina stiction e melhora resposta em baixas velocidades
+
+#### **Características do Sistema:**
+
+- **Frequência de controle:** 33Hz (30ms de período)
+- **Rampa de aceleração:** 0.4 m/s² máximo
+- **Filtro passa-baixas:** α = 0.1 (suavização exponencial)
+- **Encoders:** 64 pulsos/rotação
+- **Thread-safe:** Mutex para proteção de variáveis compartilhadas
+
+### 🗺️ Navegação e Localização
+
+#### **Detecção de AprilTags:**
+
+- Biblioteca `pupil_apriltags` para detecção
+- Família de tags: 36h11
+- Tamanho físico: 12cm
+- Calibração de câmera: fx=298.3, fy=306.9, cx=158.8, cy=121.7
+
+#### **Localização:**
+
+- Cálculo de pose (x, y, θ) baseado em AprilTags detectadas
+- Transformação 3D → 2D para navegação planar
+- Fusão com odometria dos encoders
+
+#### **Navegação Autônoma:**
+
+- Waypoint navigation com correção de trajetória
+- Controlador angular proporcional
+- Tolerância: 5cm (posição), 0.5rad (orientação)
+- Estados: idle, running, completed, error
+
+---
+
+## 5️⃣ Montagem Geral
+
+### Processo de Montagem
+
+A montagem do robô seguiu as seguintes etapas:
+
+#### **1. Impressão 3D das Peças**
+
+Todas as peças foram impressas em PLA/ABS utilizando os arquivos STL disponíveis:
+
+- Estrutura do garfo e guias
+- Compartimentos para eletrônica
+- Suportes e fixações
+- Sistema de polias
+
+#### **2. Montagem da Estrutura Base**
+
+- Fixação do chassis principal
+- Instalação das rodas motorizadas
+- Montagem do compartimento de baterias
+- Instalação do contrapeso para balanceamento
+
+#### **3. Montagem do Sistema de Elevação**
+
+- Instalação da guia vertical (15cm)
+- Fixação do garfo móvel
+- Montagem do sistema de polias
+- Conexão do motor de elevação (hardware pronto)
+
+#### **4. Integração Eletrônica**
+
+- Instalação do ESP32 no suporte superior
+- Conexão da Ponte H aos motores
+- Fiação das baterias (3x em série = 12V)
+- Conexão dos encoders
+- Instalação do regulador de tensão
+
+#### **5. Limitações da Montagem**
+
+**Problemas Estéticos:**
+
+- Como a câmera é integrada ao ESP32 e foi posicionada no alto (em cima da guia), muitos fios ficaram expostos e desorganizados
+- Isso comprometeu a aparência final do projeto
+- **Solução planejada (não implementada):** Calha para passagem de fios na guia
+
+**Componentes não Montados:**
+
+- **Motor Elevation Base:** Não foi impresso por falta de tempo
+- **Roof completo:** Foi impresso mas não montado. Esta peça seguraria o motor de elevação que ficaria em cima do roof holder
+- Como resultado, o motor de elevação permaneceu dentro do chassis
+
+**Sistema de Alimentação:**
+
+- BMS (Battery Management System) não foi implementado
+- Seria importante para segurança e longevidade das baterias
+- Configuração atual: 3 baterias 18650 em série (12V total)
+
+### Resultado Final
+
+O robô foi montado com:
+
+- ✅ Chassis estrutural completo
+- ✅ Sistema de locomoção com 2 motores + encoders
+- ✅ Garfo com guia de 15cm
+- ✅ Sistema de polias instalado
+- ✅ ESP32 com câmera integrada
+- ✅ Ponte H para controle dos motores
+- ✅ Sistema de baterias (3x 18650 em série)
+- ⚠️ Fiação exposta (sem calha organizadora)
+- ⚠️ Motor de elevação sem software
+- ⚠️ Roof não montado completamente
+
+---
+
+## 💻 Detalhes de Implementação de Software
 
 ### 🔧 Firmware ESP32 (C++)
 
-O firmware foi desenvolvido em C++ usando o framework Arduino para ESP32. Principais funcionalidades implementadas:
-
-#### **Comunicação WiFi e WebSocket**
-
-- Ponto de acesso WiFi (`ESP32_Robot_AP`) para conexão direta com o robô
-- Servidor WebSocket na porta 8000 para comunicação bidirecionional em tempo real
-- Transmissão de telemetria a 20Hz (50ms de período)
-- Sistema de heartbeat para failsafe automático
-
-#### **Controle dos Motores de Locomoção**
-
-- Controle diferencial de duas rodas independentes
-- **Encoders** para feedback de posição e velocidade (64 pulsos por rotação)
-- **Controlador PID** otimizado com:
-  - Feedforward para compensação de velocidade desejada
-  - Termo proporcional (kp) para correção de erro
-  - Termo integral (ki) com anti-windup
-  - Constante estática (ks) para vencer atrito inicial
-  - **Dithering** (vibração de alta frequência) para reduzir zona morta e stiction
-- **Rampa de aceleração** para evitar movimentos bruscos
-- **Filtro passa-baixas** exponencial para suavização da leitura de velocidade
-- Loop de controle de alta precisão a 33Hz usando timer de hardware (`esp_timer`)
-- Tratamento especial para detecção de parada (timeout de encoder)
-
-#### **Sistema de Câmera**
-
-- Câmera ESP32-CAM integrada (resolução 320x240)
-- Streaming de vídeo em JPEG via WebSocket
-- Taxa de transmissão configurável (padrão: 5fps)
-- Buffer otimizado para evitar travamentos
-
-#### **Thread Safety**
-
-- Uso de `portMUX_TYPE` para proteção de variáveis compartilhadas
-- Seções críticas ISR-safe (`portENTER_CRITICAL_ISR`)
-- Separação clara entre leitura de comandos e escrita de telemetria
+Desenvolvido em C++ usando o framework Arduino para ESP32.
 
 **Arquivos principais:**
 
 - [main.cpp](src/main.cpp) - Loop principal e coordenação de sistemas
 - [camera_pins.h](src/camera_pins.h) - Definição de pinos da câmera
 
----
-
 ### 🐍 Backend Python (FastAPI)
 
-O servidor backend em Python atua como intermediário inteligente entre a interface do usuário e o robô. Principais componentes:
-
-#### **Processamento de Visão Computacional**
-
-- **Detecção de AprilTags** usando a biblioteca `pupil_apriltags`
-- Decodificação eficiente de JPEG usando `TurboJPEG`
-- Calibração de câmera (parâmetros intrínsecos: fx, fy, cx, cy)
-- Cálculo de pose 3D das tags detectadas
-- Transformação de coordenadas 3D→2D para navegação planar
-- Mapeamento de tags para posições globais no ambiente
-
-#### **Odometria e Localização**
-
-- Cálculo de pose do robô (x, y, θ) baseado em AprilTags
-- Integração de dados de encoder para odometria
-- Estimativa de posição em tempo real
-- Cálculo de distância percorrida por cada roda
-
-#### **Sistema de Navegação Autônoma**
-
-- Controle de missões com waypoints
-- Algoritmo de navegação diferencial
-- **Controlador angular** proporcional para alinhamento
-- **Limitação de velocidade angular** para estabilidade
-- Tolerância de chegada configurável (5cm, 0.5rad)
-- Estados de missão: idle, running, completed, error
-
-#### **Comunicação Multi-Cliente**
-
-- Servidor FastAPI com endpoints REST e WebSocket
-- WebSocket dedicado para comunicação com ESP32
-- WebSocket broadcast para dashboards (múltiplos clientes)
-- Heartbeat automático a 5Hz para manter conexão
-- CORS habilitado para desenvolvimento
-
-#### **Streaming de Dados**
-
-- Broadcast de estado do robô (pose, velocidades, debug PID)
-- Snapshot de detecções de visão
-- Gráficos em tempo real de telemetria
-- Histórico de comandos e respostas
+O servidor backend em Python atua como intermediário inteligente entre a interface do usuário e o robô.
 
 **Arquivos principais:**
 
 - [main.py](ui/main.py) - Servidor principal e lógica de controle
 - [gabriel_client.py](ui/gabriel_client.py) - Cliente simples para testes
 - [calibrate_camera.py](ui/calibrate_camera.py) - Calibração da câmera
-
----
+- [fake_robot.py](ui/fake_robot.py) - Simulador para testes
+- [simple_server.py](ui/simple_server.py) - Servidor simplificado
 
 ### ⚛️ Frontend Web (React + TypeScript)
 
-Interface moderna e responsiva desenvolvida com React 18, TypeScript e Chakra UI:
+Interface moderna e responsiva desenvolvida com React 18, TypeScript e Chakra UI.
 
-#### **Controle Manual**
+**Funcionalidades:**
 
-- Botões direcionais (W, A, S, D) para movimentação
-- Controle via teclado com detecção de teclas
-- Botão de parada de emergência
-- Feedback visual do estado de conexão
-
-#### **Visualização de Câmera**
-
-- Stream de vídeo em tempo real do robô
-- Overlay de detecções de AprilTags
-- Visualização de pose estimada
-- Indicadores de distância e ângulo das tags
-
-#### **Painel de Telemetria**
-
-- Gráficos em tempo real das velocidades (target vs medida)
-- Visualização dos componentes do PID (P, I, Feedforward)
-- Monitoramento de PWM aplicado
-- Gráficos independentes para roda esquerda e direita
-- Histórico de até 600 pontos (30 segundos a 20Hz)
-
-#### **Controle de Missões**
-
-- Interface para definir waypoints (x, y)
-- Controle de velocidade de navegação
-- Indicador de estado da missão
-- Visualização da pose atual do robô
-
-#### **Monitoramento**
-
-- Badge de status de conexão WebSocket
-- Indicadores de latência
-- Timestamp da última atualização
-- Valores de encoder em tempo real
-
-**Tecnologias utilizadas:**
-
-- React 18 + TypeScript
-- Chakra UI para componentes
-- Vite para build otimizado
-- Canvas API para gráficos customizados
-- WebSocket API nativa
+- Controle manual (WASD) e autônomo (waypoints)
+- Visualização de câmera em tempo real
+- Gráficos de telemetria (velocidade, PID, PWM)
+- Monitoramento de AprilTags
+- Dashboard de estado do robô
 
 **Arquivos principais:**
 
 - [App.tsx](ui-frontend/src/App.tsx) - Componente principal
 - [CameraFeed.tsx](ui-frontend/src/components/CameraFeed.tsx) - Visualização de vídeo
 - [types.ts](ui-frontend/src/types.ts) - Definições de tipos
+- [theme.ts](ui-frontend/src/theme.ts) - Configuração de tema
 
 ---
 

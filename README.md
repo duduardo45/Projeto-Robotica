@@ -159,7 +159,7 @@ O sistema utiliza uma arquitetura de três camadas:
 ### Interface de Controle
 
 - **Interface Web moderna** (React + TypeScript)
-- **Controle manual** via teclado (WASD)
+- **Controle manual** via botões de interface
 - **Controle autônomo** via waypoints
 - **Visualização em tempo real** de câmera e telemetria
 - **Gráficos de debug** para ajuste de PID
@@ -324,10 +324,13 @@ O servidor backend em Python atua como intermediário inteligente entre a interf
 **Arquivos principais:**
 
 - [main.py](ui/main.py) - Servidor principal e lógica de controle
-- [gabriel_client.py](ui/gabriel_client.py) - Cliente simples para testes
 - [calibrate_camera.py](ui/calibrate_camera.py) - Calibração da câmera
+
+**Arquivos para testes:**
+
 - [fake_robot.py](ui/fake_robot.py) - Simulador para testes
 - [simple_server.py](ui/simple_server.py) - Servidor simplificado
+- [gabriel_client.py](ui/gabriel_client.py) - Cliente simples para testes
 
 ### ⚛️ Frontend Web (React + TypeScript)
 
@@ -335,7 +338,7 @@ Interface moderna e responsiva desenvolvida com React 18, TypeScript e Chakra UI
 
 **Funcionalidades:**
 
-- Controle manual (WASD) e autônomo (waypoints)
+- Controle manual e autônomo
 - Visualização de câmera em tempo real
 - Gráficos de telemetria (velocidade, PID, PWM)
 - Monitoramento de AprilTags
@@ -386,12 +389,12 @@ pnpm dev
 ### 1. Modo Manual
 
 - Controle direto via interface web ou cliente Python
-- Comandos WASD para movimento
+- Comandos via botões de interface para movimento
 - Feedback em tempo real de telemetria
 
 ### 2. Modo Autônomo
 
-- Definição de waypoints via interface
+- Definição de waypoint de destino via interface
 - Navegação automática com correção de trajetória
 - Localização baseada em AprilTags
 - Parada automática ao atingir objetivo
@@ -401,7 +404,7 @@ pnpm dev
 ### Controle PID Otimizado
 
 - **Frequência**: 33Hz (30ms de período)
-- **Dithering**: 25Hz para redução de stiction
+- **Dithering**: implementado para redução de stiction
 - **Anti-windup**: Clamp do integrador em ±6.0
 - **Rampa**: Aceleração máxima de 0.4 m/s²
 - **Filtro**: α = 0.1 para suavização exponencial

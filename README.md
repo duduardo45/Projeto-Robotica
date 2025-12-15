@@ -112,7 +112,6 @@ O robô foi montado com:
   - Controle de velocidade via PWM
   - Duas Ponte H (uma para motores de locomoção e uma para o de elevação)
 - **Encoders ópticos** conectados via interrupção
-  
 
 ## 3️⃣ Solução de Comunicação
 
@@ -252,7 +251,7 @@ Todas as peças foram impressas utilizando os arquivos STL disponíveis:
 
 #### **2. Montagem da Estrutura Base**
 
-- Montagem do teto do robô
+- Montagem do roof holder do robô
 - Montagem do compartimento de baterias
 - Instalação do contrapeso para balanceamento
 
@@ -488,7 +487,7 @@ Estes problemas mecânicos, de atrito e de comunicação impactaram significativ
 
 2. **Comunicação WiFi/WebSocket**
 
-   - Conexão estável e de baixa latência
+   - Conexão funcional (com latência perceptível no controle manual)
    - Protocolo bem definido e extensível
 
 3. **Visão computacional**

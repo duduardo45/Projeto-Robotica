@@ -53,7 +53,7 @@ Todas as peças estruturais foram projetadas em CAD e impressas em 3D. Os arquiv
 
 Algumas peças foram modeladas mas não foram utilizadas na montagem final:
 
-- [Battery Support (Suporte de Bateria)](Modelagem3D/Battery%20Container%20Support.stl) - Não foi utilizado pois se tornou redundante, já que o compartimento de baterias conseguia ser travado através do teto (roof) e havia a necessidade de passagem de fios pela parte inferior do suporte.
+- [Battery Support (Suporte de Bateria)](Modelagem3D/Battery%20Container%20Support.stl) - Não foi utilizado pois se tornou redundante, já que o compartimento de baterias conseguia ser travado através do teto (roof holder) e havia a necessidade de passagem de fios pela parte inferior do suporte.
 - [Motor Holder (Suporte do Motor)](Modelagem3D/Motor%20Holder.stl) - Não houve tempo hábil para instalar o componente.
 - [Polia](Modelagem3D/Polia%20-%20Part%201.stl) - A polia acabou não sendo utilizada, preferindo conectar o fio que levanta o garfo diretamente no motor.
 

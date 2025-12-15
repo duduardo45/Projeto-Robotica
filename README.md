@@ -6,7 +6,7 @@ Este repositório contém o projeto completo de uma empilhadeira autônoma desen
 
 - Eduardo Eugênio de Souza
 - Enzo Mediano
-- Luisa Silveira
+- Luísa Ferreira da Silveira
 - Luiz Felipe Neves Batista
 
 ## 🎯 Objetivo do Projeto

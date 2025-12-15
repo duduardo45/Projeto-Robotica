@@ -540,56 +540,6 @@ Estes problemas mecânicos, de atrito e de comunicação impactaram significativ
 
 ---
 
-## 📁 Estrutura de Diretórios
-
-```
-Projeto-Robotica/
-├─ platformio.ini
-├─ README.md
-├─ src/                  # Firmware ESP32 (C++)
-│  ├─ main.cpp
-│  ├─ camera_pins.h
-│  ├─ david_code.cpp
-│  └─ gabriel_code.cpp
-├─ ui/                   # Backend Python (FastAPI + visão)
-│  ├─ main.py
-│  ├─ gabriel_client.py
-│  ├─ calibrate_camera.py
-│  ├─ fake_robot.py
-│  ├─ simple_server.py
-│  ├─ pyproject.toml
-│  ├─ uv.lock
-│  └─ esp32_calibration_images/
-├─ ui-frontend/          # Frontend React + TS
-│  ├─ src/
-│  │  ├─ App.tsx
-│  │  ├─ main.tsx
-│  │  ├─ theme.ts
-│  │  ├─ types.ts
-│  │  ├─ App.css
-│  │  ├─ index.css
-│  │  └─ components/CameraFeed.tsx
-│  ├─ public/
-│  ├─ package.json
-│  ├─ package-lock.json
-│  ├─ pnpm-lock.yaml
-│  ├─ tsconfig.json
-│  ├─ tsconfig.app.json
-│  ├─ tsconfig.node.json
-│  ├─ vite.config.ts
-│  └─ README.md
-├─ Modelagem3D/          # Peças 3D (STL)
-│  └─ *.stl
-├─ Imagens-Videos-Robo/  # Fotos e vídeos de teste
-├─ mosquitto/            # Configuração MQTT (não usada)
-│  └─ config/mosquitto.conf
-├─ include/README
-├─ lib/README
-└─ test/README
-```
-
----
-
 ## 🛠️ Dependências Principais
 
 ### ESP32

@@ -19,7 +19,7 @@ O desafio proposto foi desenvolver uma empilhadeira autônoma com os seguintes r
 - **Leitura de AprilTags** para localização no terreno e identificação de pallets
 - **Alimentação** por baterias 18650
 
-## 🏗️ Arquitetura do Sistema
+## Arquitetura do Sistema
 
 O projeto foi desenvolvido seguindo uma abordagem integrada de hardware e software, dividido em 5 soluções principais:
 
@@ -544,29 +544,48 @@ Estes problemas mecânicos, de atrito e de comunicação impactaram significativ
 
 ```
 Projeto-Robotica/
-├── src/                    # Firmware ESP32 (C++)
-│   ├── main.cpp           # Código principal
-│   ├── camera_pins.h      # Configuração da câmera
-│   ├── david_code.cpp     # Experimentos
-│   └── gabriel_code.cpp   # Experimentos
-├── ui/                     # Backend Python
-│   ├── main.py            # Servidor FastAPI
-│   ├── gabriel_client.py  # Cliente de teste
-│   ├── calibrate_camera.py # Calibração
-│   └── fake_robot.py      # Simulador
-├── ui-frontend/           # Frontend React
-│   ├── src/
-│   │   ├── App.tsx        # Componente principal
-│   │   ├── components/    # Componentes React
-│   │   └── types.ts       # Definições TypeScript
-│   └── package.json
-├── Modelagem3D/           # Peças 3D (STL)
-│   ├── Guia + Garfo - *.stl
-│   ├── Case_Baterias.stl
-│   └── ...
-├── mosquitto/             # Configuração MQTT (não usado)
-├── platformio.ini         # Configuração ESP32
-└── README.md
+├─ platformio.ini
+├─ README.md
+├─ src/                  # Firmware ESP32 (C++)
+│  ├─ main.cpp
+│  ├─ camera_pins.h
+│  ├─ david_code.cpp
+│  └─ gabriel_code.cpp
+├─ ui/                   # Backend Python (FastAPI + visão)
+│  ├─ main.py
+│  ├─ gabriel_client.py
+│  ├─ calibrate_camera.py
+│  ├─ fake_robot.py
+│  ├─ simple_server.py
+│  ├─ pyproject.toml
+│  ├─ uv.lock
+│  └─ esp32_calibration_images/
+├─ ui-frontend/          # Frontend React + TS
+│  ├─ src/
+│  │  ├─ App.tsx
+│  │  ├─ main.tsx
+│  │  ├─ theme.ts
+│  │  ├─ types.ts
+│  │  ├─ App.css
+│  │  ├─ index.css
+│  │  └─ components/CameraFeed.tsx
+│  ├─ public/
+│  ├─ package.json
+│  ├─ package-lock.json
+│  ├─ pnpm-lock.yaml
+│  ├─ tsconfig.json
+│  ├─ tsconfig.app.json
+│  ├─ tsconfig.node.json
+│  ├─ vite.config.ts
+│  └─ README.md
+├─ Modelagem3D/          # Peças 3D (STL)
+│  └─ *.stl
+├─ Imagens-Videos-Robo/  # Fotos e vídeos de teste
+├─ mosquitto/            # Configuração MQTT (não usada)
+│  └─ config/mosquitto.conf
+├─ include/README
+├─ lib/README
+└─ test/README
 ```
 
 ---

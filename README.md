@@ -396,8 +396,6 @@ pnpm dev
 - Localização baseada em AprilTags
 - Parada automática ao atingir objetivo
 
----
-
 ## 📊 Características Técnicas do Software
 
 ### Controle PID Otimizado
@@ -421,8 +419,6 @@ pnpm dev
 - **Tamanho**: 12cm (físico)
 - **Calibração**: Fx=298.3, Fy=306.9, Cx=158.8, Cy=121.7
 - **Detecção**: Tempo real (<50ms por frame)
-
----
 
 ## ⚠️ Limitações e Trabalho Futuro
 
